@@ -1,9 +1,11 @@
 /* eslint-disable sonarjs/cognitive-complexity */
-import { uniqueOptions } from 'container/NewDashboard/DashboardVariablesSelection/util';
+import { uniqueOptions } from 'container/DashboardContainer/DashboardVariablesSelection/util';
 
 import { OptionData } from './types';
 
 export const SPACEKEY = ' ';
+
+export const ALL_SELECTED_VALUE = '__ALL__'; // Constant for the special value
 
 export const prioritizeOrAddOptionForSingleSelect = (
 	options: OptionData[],

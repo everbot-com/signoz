@@ -3,7 +3,7 @@
 	.query-section-tabs {
 		display: flex;
 		align-items: center;
-		margin-left: 12px;
+		margin-left: 8px;
 		margin-top: 24px;
 
 		.query-section-query-actions {
@@ -132,7 +132,7 @@
 					border-bottom: 0.5px solid var(--bg-vanilla-300);
 
 					&.active-tab {
-						background-color: var(--bg-vanilla-100);
+						background-color: var(--bg-vanilla-300);
 
 						&:hover {
 							background-color: var(--bg-vanilla-100) !important;

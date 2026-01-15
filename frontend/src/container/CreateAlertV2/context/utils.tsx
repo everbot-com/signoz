@@ -1,3 +1,5 @@
+import { UTC_TIMEZONE } from 'components/CustomTimePicker/timezoneUtils';
+import { UniversalYAxisUnit } from 'components/YAxisUnitSelector/types';
 import { QueryParams } from 'constants/query';
 import {
 	alertDefaults,
@@ -11,6 +13,7 @@ import { AlertDef } from 'types/api/alerts/def';
 import { Query } from 'types/api/queryBuilder/queryBuilderData';
 import { DataSource } from 'types/common/queryBuilder';
 
+import { CumulativeWindowTimeframes } from '../EvaluationSettings/types';
 import {
 	INITIAL_ADVANCED_OPTIONS_STATE,
 	INITIAL_ALERT_STATE,
@@ -53,6 +56,8 @@ export const alertCreationReducer = (
 			};
 		case 'RESET':
 			return INITIAL_ALERT_STATE;
+		case 'SET_INITIAL_STATE':
+			return action.payload;
 		default:
 			return state;
 	}
@@ -60,7 +65,7 @@ export const alertCreationReducer = (
 
 export function getInitialAlertType(currentQuery: Query): AlertTypes {
 	const dataSource =
-		currentQuery.builder.queryData[0].dataSource || DataSource.METRICS;
+		currentQuery.builder.queryData?.[0]?.dataSource || DataSource.METRICS;
 	switch (dataSource) {
 		case DataSource.METRICS:
 			return AlertTypes.METRICS_BASED_ALERT;
@@ -119,6 +124,8 @@ export const alertThresholdReducer = (
 			return { ...state, thresholds: action.payload };
 		case 'RESET':
 			return INITIAL_ALERT_THRESHOLD_STATE;
+		case 'SET_INITIAL_STATE':
+			return action.payload;
 		default:
 			return state;
 	}
@@ -174,6 +181,8 @@ export const advancedOptionsReducer = (
 				...state,
 				evaluationCadence: { ...state.evaluationCadence, mode: action.payload },
 			};
+		case 'SET_INITIAL_STATE':
+			return action.payload;
 		case 'RESET':
 			return INITIAL_ADVANCED_OPTIONS_STATE;
 		default:
@@ -202,6 +211,20 @@ export const evaluationWindowReducer = (
 			return { ...state, startingAt: action.payload };
 		case 'RESET':
 			return INITIAL_EVALUATION_WINDOW_STATE;
+		case 'SET_INITIAL_STATE':
+			return action.payload;
+		case 'SET_INITIAL_STATE_FOR_METER':
+			return {
+				...state,
+				windowType: 'cumulative',
+				timeframe: CumulativeWindowTimeframes.CURRENT_DAY,
+				startingAt: {
+					time: '00:00:00',
+					number: '0',
+					timezone: UTC_TIMEZONE.value,
+					unit: UniversalYAxisUnit.MINUTES,
+				},
+			};
 		default:
 			return state;
 	}
@@ -222,6 +245,8 @@ export const notificationSettingsReducer = (
 			return { ...state, routingPolicies: action.payload };
 		case 'RESET':
 			return INITIAL_NOTIFICATION_SETTINGS_STATE;
+		case 'SET_INITIAL_STATE':
+			return action.payload;
 		default:
 			return state;
 	}

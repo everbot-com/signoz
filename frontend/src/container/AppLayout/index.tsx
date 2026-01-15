@@ -12,8 +12,8 @@ import getChangelogByVersion from 'api/changelog/getChangelogByVersion';
 import logEvent from 'api/common/logEvent';
 import manageCreditCardApi from 'api/v1/portal/create';
 import updateUserPreference from 'api/v1/user/preferences/name/update';
+import getUserVersion from 'api/v1/version/get';
 import getUserLatestVersion from 'api/v1/version/getLatestVersion';
-import getUserVersion from 'api/v1/version/getVersion';
 import { AxiosError } from 'axios';
 import cx from 'classnames';
 import ChangelogModal from 'components/ChangelogModal/ChangelogModal';
@@ -111,6 +111,8 @@ function AppLayout(props: AppLayoutProps): JSX.Element {
 		showPaymentFailedWarning,
 		setShowPaymentFailedWarning,
 	] = useState<boolean>(false);
+
+	const errorBoundaryRef = useRef<Sentry.ErrorBoundary>(null);
 
 	const [showSlowApiWarning, setShowSlowApiWarning] = useState(false);
 	const [slowApiWarningShown, setSlowApiWarningShown] = useState(false);
@@ -317,14 +319,14 @@ function AppLayout(props: AppLayoutProps): JSX.Element {
 			getUserVersionResponse.isFetched &&
 			getUserVersionResponse.isSuccess &&
 			getUserVersionResponse.data &&
-			getUserVersionResponse.data.payload
+			getUserVersionResponse.data.data
 		) {
 			dispatch({
 				type: UPDATE_CURRENT_VERSION,
 				payload: {
-					currentVersion: getUserVersionResponse.data.payload.version,
-					ee: getUserVersionResponse.data.payload.ee,
-					setupCompleted: getUserVersionResponse.data.payload.setupCompleted,
+					currentVersion: getUserVersionResponse.data.data.version,
+					ee: getUserVersionResponse.data.data.ee,
+					setupCompleted: getUserVersionResponse.data.data.setupCompleted,
 				},
 			});
 		}
@@ -378,10 +380,20 @@ function AppLayout(props: AppLayoutProps): JSX.Element {
 		getChangelogByVersionResponse.isSuccess,
 	]);
 
+	// reset error boundary on route change
+	useEffect(() => {
+		if (errorBoundaryRef.current) {
+			errorBoundaryRef.current.resetErrorBoundary();
+		}
+	}, [pathname]);
+
 	const isToDisplayLayout = isLoggedIn;
 
 	const routeKey = useMemo(() => getRouteKey(pathname), [pathname]);
 	const pageTitle = t(routeKey);
+
+	const isPublicDashboard = pathname.startsWith('/public/dashboard/');
+
 	const renderFullScreen =
 		pathname === ROUTES.GET_STARTED ||
 		pathname === ROUTES.ONBOARDING ||
@@ -390,7 +402,8 @@ function AppLayout(props: AppLayoutProps): JSX.Element {
 		pathname === ROUTES.GET_STARTED_INFRASTRUCTURE_MONITORING ||
 		pathname === ROUTES.GET_STARTED_LOGS_MANAGEMENT ||
 		pathname === ROUTES.GET_STARTED_AWS_MONITORING ||
-		pathname === ROUTES.GET_STARTED_AZURE_MONITORING;
+		pathname === ROUTES.GET_STARTED_AZURE_MONITORING ||
+		isPublicDashboard;
 
 	const [showTrialExpiryBanner, setShowTrialExpiryBanner] = useState(false);
 
@@ -836,7 +849,10 @@ function AppLayout(props: AppLayoutProps): JSX.Element {
 					})}
 					data-overlayscrollbars-initialize
 				>
-					<Sentry.ErrorBoundary fallback={<ErrorBoundaryFallback />}>
+					<Sentry.ErrorBoundary
+						fallback={<ErrorBoundaryFallback />}
+						ref={errorBoundaryRef}
+					>
 						<LayoutContent data-overlayscrollbars-initialize>
 							<OverlayScrollbar>
 								<ChildrenContainer>

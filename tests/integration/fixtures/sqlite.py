@@ -58,7 +58,7 @@ def sqlite(
                 host_configs={},
                 container_configs={},
             ),
-            conn=conn,
+            conn=engine,
             env=cache["env"],
         )
 

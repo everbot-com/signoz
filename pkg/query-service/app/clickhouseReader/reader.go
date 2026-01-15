@@ -43,6 +43,7 @@ import (
 	"github.com/SigNoz/signoz/pkg/query-service/app/traces/tracedetail"
 	"github.com/SigNoz/signoz/pkg/query-service/common"
 	"github.com/SigNoz/signoz/pkg/query-service/constants"
+
 	chErrors "github.com/SigNoz/signoz/pkg/query-service/errors"
 	"github.com/SigNoz/signoz/pkg/query-service/metrics"
 	"github.com/SigNoz/signoz/pkg/query-service/model"
@@ -154,6 +155,7 @@ type ClickHouseReader struct {
 
 	fluxIntervalForTraceDetail time.Duration
 	cache                      cache.Cache
+	cacheForTraceDetail        cache.Cache
 	metadataDB                 string
 	metadataTable              string
 }
@@ -165,21 +167,14 @@ func NewReader(
 	prometheus prometheus.Prometheus,
 	cluster string,
 	fluxIntervalForTraceDetail time.Duration,
+	cacheForTraceDetail cache.Cache,
 	cache cache.Cache,
-) *ClickHouseReader {
-	options := NewOptions(primaryNamespace, archiveNamespace)
-	return NewReaderFromClickhouseConnection(options, sqlDB, telemetryStore, prometheus, cluster, fluxIntervalForTraceDetail, cache)
-}
-
-func NewReaderFromClickhouseConnection(
 	options *Options,
-	sqlDB sqlstore.SQLStore,
-	telemetryStore telemetrystore.TelemetryStore,
-	prometheus prometheus.Prometheus,
-	cluster string,
-	fluxIntervalForTraceDetail time.Duration,
-	cache cache.Cache,
 ) *ClickHouseReader {
+	if options == nil {
+		options = NewOptions(primaryNamespace, archiveNamespace)
+	}
+
 	logsTableName := options.primary.LogsTableV2
 	logsLocalTableName := options.primary.LogsLocalTableV2
 	traceTableName := options.primary.TraceIndexTableV3
@@ -221,6 +216,7 @@ func NewReaderFromClickhouseConnection(
 		traceSummaryTable:          options.primary.TraceSummaryTable,
 		fluxIntervalForTraceDetail: fluxIntervalForTraceDetail,
 		cache:                      cache,
+		cacheForTraceDetail:        cacheForTraceDetail,
 		metadataDB:                 options.primary.MetadataDB,
 		metadataTable:              options.primary.MetadataTable,
 	}
@@ -859,7 +855,7 @@ func (r *ClickHouseReader) GetSpansForTrace(ctx context.Context, traceID string,
 
 func (r *ClickHouseReader) GetWaterfallSpansForTraceWithMetadataCache(ctx context.Context, orgID valuer.UUID, traceID string) (*model.GetWaterfallSpansForTraceWithMetadataCache, error) {
 	cachedTraceData := new(model.GetWaterfallSpansForTraceWithMetadataCache)
-	err := r.cache.Get(ctx, orgID, strings.Join([]string{"getWaterfallSpansForTraceWithMetadata", traceID}, "-"), cachedTraceData, false)
+	err := r.cacheForTraceDetail.Get(ctx, orgID, strings.Join([]string{"getWaterfallSpansForTraceWithMetadata", traceID}, "-"), cachedTraceData)
 	if err != nil {
 		zap.L().Debug("error in retrieving getWaterfallSpansForTraceWithMetadata cache", zap.Error(err), zap.String("traceID", traceID))
 		return nil, err
@@ -938,6 +934,8 @@ func (r *ClickHouseReader) GetWaterfallSpansForTraceWithMetadata(ctx context.Con
 				events = append(events, eventMap)
 			}
 
+			startTimeUnixNano := uint64(item.TimeUnixNano.UnixNano())
+
 			jsonItem := model.Span{
 				SpanID:           item.SpanID,
 				TraceID:          item.TraceID,
@@ -953,10 +951,10 @@ func (r *ClickHouseReader) GetWaterfallSpansForTraceWithMetadata(ctx context.Con
 				Events:           events,
 				TagMap:           item.Attributes_string,
 				Children:         make([]*model.Span, 0),
+				TimeUnixNano:     startTimeUnixNano, // Store nanoseconds temporarily
 			}
 
 			// metadata calculation
-			startTimeUnixNano := uint64(item.TimeUnixNano.UnixNano())
 			if startTime == 0 || startTimeUnixNano < startTime {
 				startTime = startTimeUnixNano
 			}
@@ -971,12 +969,9 @@ func (r *ClickHouseReader) GetWaterfallSpansForTraceWithMetadata(ctx context.Con
 				totalErrorSpans = totalErrorSpans + 1
 			}
 
-			// convert start timestamp to millis because right now frontend is expecting it in millis
-			jsonItem.TimeUnixNano = uint64(item.TimeUnixNano.UnixNano() / 1000000)
-
 			// collect the intervals for service for execution time calculation
 			serviceNameIntervalMap[jsonItem.ServiceName] =
-				append(serviceNameIntervalMap[jsonItem.ServiceName], tracedetail.Interval{StartTime: jsonItem.TimeUnixNano, Duration: jsonItem.DurationNano / 1000000, Service: jsonItem.ServiceName})
+				append(serviceNameIntervalMap[jsonItem.ServiceName], tracedetail.Interval{StartTime: jsonItem.TimeUnixNano, Duration: jsonItem.DurationNano, Service: jsonItem.ServiceName})
 
 			// append to the span node map
 			spanIdToSpanNodeMap[jsonItem.SpanID] = &jsonItem
@@ -1044,7 +1039,7 @@ func (r *ClickHouseReader) GetWaterfallSpansForTraceWithMetadata(ctx context.Con
 		}
 
 		zap.L().Info("getWaterfallSpansForTraceWithMetadata: processing pre cache", zap.Duration("duration", time.Since(processingBeforeCache)), zap.String("traceID", traceID))
-		cacheErr := r.cache.Set(ctx, orgID, strings.Join([]string{"getWaterfallSpansForTraceWithMetadata", traceID}, "-"), &traceCache, time.Minute*5)
+		cacheErr := r.cacheForTraceDetail.Set(ctx, orgID, strings.Join([]string{"getWaterfallSpansForTraceWithMetadata", traceID}, "-"), &traceCache, time.Minute*5)
 		if cacheErr != nil {
 			zap.L().Debug("failed to store cache for getWaterfallSpansForTraceWithMetadata", zap.String("traceID", traceID), zap.Error(err))
 		}
@@ -1053,6 +1048,15 @@ func (r *ClickHouseReader) GetWaterfallSpansForTraceWithMetadata(ctx context.Con
 	processingPostCache := time.Now()
 	selectedSpans, uncollapsedSpans, rootServiceName, rootServiceEntryPoint := tracedetail.GetSelectedSpans(req.UncollapsedSpans, req.SelectedSpanID, traceRoots, spanIdToSpanNodeMap, req.IsSelectedSpanIDUnCollapsed)
 	zap.L().Info("getWaterfallSpansForTraceWithMetadata: processing post cache", zap.Duration("duration", time.Since(processingPostCache)), zap.String("traceID", traceID))
+
+	// convert start timestamp to millis because right now frontend is expecting it in millis
+	for _, span := range selectedSpans {
+		span.TimeUnixNano = span.TimeUnixNano / 1000000
+	}
+
+	for serviceName, totalDuration := range serviceNameToTotalDurationMap {
+		serviceNameToTotalDurationMap[serviceName] = totalDuration / 1000000
+	}
 
 	response.Spans = selectedSpans
 	response.UncollapsedSpans = uncollapsedSpans
@@ -1069,7 +1073,7 @@ func (r *ClickHouseReader) GetWaterfallSpansForTraceWithMetadata(ctx context.Con
 
 func (r *ClickHouseReader) GetFlamegraphSpansForTraceCache(ctx context.Context, orgID valuer.UUID, traceID string) (*model.GetFlamegraphSpansForTraceCache, error) {
 	cachedTraceData := new(model.GetFlamegraphSpansForTraceCache)
-	err := r.cache.Get(ctx, orgID, strings.Join([]string{"getFlamegraphSpansForTrace", traceID}, "-"), cachedTraceData, false)
+	err := r.cacheForTraceDetail.Get(ctx, orgID, strings.Join([]string{"getFlamegraphSpansForTrace", traceID}, "-"), cachedTraceData)
 	if err != nil {
 		zap.L().Debug("error in retrieving getFlamegraphSpansForTrace cache", zap.Error(err), zap.String("traceID", traceID))
 		return nil, err
@@ -1205,7 +1209,7 @@ func (r *ClickHouseReader) GetFlamegraphSpansForTrace(ctx context.Context, orgID
 		}
 
 		zap.L().Info("getFlamegraphSpansForTrace: processing pre cache", zap.Duration("duration", time.Since(processingBeforeCache)), zap.String("traceID", traceID))
-		cacheErr := r.cache.Set(ctx, orgID, strings.Join([]string{"getFlamegraphSpansForTrace", traceID}, "-"), &traceCache, time.Minute*5)
+		cacheErr := r.cacheForTraceDetail.Set(ctx, orgID, strings.Join([]string{"getFlamegraphSpansForTrace", traceID}, "-"), &traceCache, time.Minute*5)
 		if cacheErr != nil {
 			zap.L().Debug("failed to store cache for getFlamegraphSpansForTrace", zap.String("traceID", traceID), zap.Error(err))
 		}
@@ -1293,12 +1297,17 @@ func (r *ClickHouseReader) setTTLLogs(ctx context.Context, orgID string, params 
 		coldStorageDuration = int(params.ToColdStorageDuration)
 	}
 
-	tableNameArray := []string{r.logsDB + "." + r.logsLocalTableV2, r.logsDB + "." + r.logsResourceLocalTableV2}
+	tableNameArray := []string{
+		r.logsDB + "." + r.logsLocalTableV2,
+		r.logsDB + "." + r.logsResourceLocalTableV2,
+		getLocalTableName(r.logsDB + "." + r.logsAttributeKeys),
+		getLocalTableName(r.logsDB + "." + r.logsResourceKeys),
+	}
 
 	// check if there is existing things to be done
 	for _, tableName := range tableNameArray {
-		statusItem, err := r.checkTTLStatusItem(ctx, orgID, tableName)
-		if err != nil {
+		statusItem, apiErr := r.checkTTLStatusItem(ctx, orgID, tableName)
+		if apiErr != nil {
 			return nil, &model.ApiError{Typ: model.ErrorExec, Err: fmt.Errorf("error in processing ttl_status check sql query")}
 		}
 		if statusItem.Status == constants.StatusPending {
@@ -1327,9 +1336,19 @@ func (r *ClickHouseReader) setTTLLogs(ctx context.Context, orgID string, params 
 			params.ToColdStorageDuration, params.ColdStorageVolume)
 	}
 
+	ttlLogsV2AttributeKeys := fmt.Sprintf(
+		"ALTER TABLE %v ON CLUSTER %s MODIFY TTL timestamp + "+
+			"INTERVAL %v SECOND DELETE", tableNameArray[2], r.cluster, params.DelDuration)
+
+	ttlLogsV2ResourceKeys := fmt.Sprintf(
+		"ALTER TABLE %v ON CLUSTER %s MODIFY TTL timestamp + "+
+			"INTERVAL %v SECOND DELETE", tableNameArray[3], r.cluster, params.DelDuration)
+
 	ttlPayload := map[string]string{
 		tableNameArray[0]: ttlLogsV2,
 		tableNameArray[1]: ttlLogsV2Resource,
+		tableNameArray[2]: ttlLogsV2AttributeKeys,
+		tableNameArray[3]: ttlLogsV2ResourceKeys,
 	}
 
 	// set the ttl if nothing is pending/ no errors
@@ -1368,8 +1387,8 @@ func (r *ClickHouseReader) setTTLLogs(ctx context.Context, orgID string, params 
 			err := r.setColdStorage(context.Background(), tableName, params.ColdStorageVolume)
 			if err != nil {
 				zap.L().Error("error in setting cold storage", zap.Error(err))
-				statusItem, err := r.checkTTLStatusItem(ctx, orgID, tableName)
-				if err == nil {
+				statusItem, apiErr := r.checkTTLStatusItem(ctx, orgID, tableName)
+				if apiErr == nil {
 					_, dbErr := r.
 						sqlDB.
 						BunDB().
@@ -1435,6 +1454,7 @@ func (r *ClickHouseReader) setTTLTraces(ctx context.Context, orgID string, param
 		r.TraceDB + "." + signozUsageExplorerTable,
 		r.TraceDB + "." + defaultDependencyGraphTable,
 		r.TraceDB + "." + r.traceSummaryTable,
+		r.TraceDB + "." + r.spanAttributesKeysTable,
 	}
 
 	coldStorageDuration := -1
@@ -1444,8 +1464,8 @@ func (r *ClickHouseReader) setTTLTraces(ctx context.Context, orgID string, param
 
 	// check if there is existing things to be done
 	for _, tableName := range tableNames {
-		statusItem, err := r.checkTTLStatusItem(ctx, orgID, tableName)
-		if err != nil {
+		statusItem, apiErr := r.checkTTLStatusItem(ctx, orgID, tableName)
+		if apiErr != nil {
 			return nil, &model.ApiError{Typ: model.ErrorExec, Err: fmt.Errorf("error in processing ttl_status check sql query")}
 		}
 		if statusItem.Status == constants.StatusPending {
@@ -1502,7 +1522,7 @@ func (r *ClickHouseReader) setTTLTraces(ctx context.Context, orgID string, param
 				req = fmt.Sprintf(ttlV2Resource, tableName, r.cluster, params.DelDuration)
 			}
 
-			if len(params.ColdStorageVolume) > 0 {
+			if len(params.ColdStorageVolume) > 0 && !strings.HasSuffix(distributedTableName, r.spanAttributesKeysTable) {
 				if strings.HasSuffix(distributedTableName, r.traceResourceTableV3) {
 					req += fmt.Sprintf(ttlTracesV2ResourceColdStorage, params.ToColdStorageDuration, params.ColdStorageVolume)
 				} else {
@@ -1512,8 +1532,8 @@ func (r *ClickHouseReader) setTTLTraces(ctx context.Context, orgID string, param
 			err := r.setColdStorage(context.Background(), tableName, params.ColdStorageVolume)
 			if err != nil {
 				zap.L().Error("Error in setting cold storage", zap.Error(err))
-				statusItem, err := r.checkTTLStatusItem(ctx, orgID, tableName)
-				if err == nil {
+				statusItem, apiErr := r.checkTTLStatusItem(ctx, orgID, tableName)
+				if apiErr == nil {
 					_, dbErr := r.
 						sqlDB.
 						BunDB().
@@ -1609,8 +1629,8 @@ func (r *ClickHouseReader) SetTTLV2(ctx context.Context, orgID string, params *m
 			ttlParams.ColdStorageVolume = ""
 		}
 
-		if params.ToColdStorageDuration > 0 {
-			ttlParams.ToColdStorageDuration = params.ToColdStorageDuration
+		if params.ToColdStorageDurationDays > 0 {
+			ttlParams.ToColdStorageDuration = params.ToColdStorageDurationDays * 24 * 3600
 		} else {
 			ttlParams.ToColdStorageDuration = 0
 		}
@@ -1642,18 +1662,24 @@ func (r *ClickHouseReader) SetTTLV2(ctx context.Context, orgID string, params *m
 
 	// Calculate cold storage duration
 	coldStorageDuration := -1
-	if len(params.ColdStorageVolume) > 0 && params.ToColdStorageDuration > 0 {
-		coldStorageDuration = int(params.ToColdStorageDuration) // Already in days
+	if len(params.ColdStorageVolume) > 0 && params.ToColdStorageDurationDays > 0 {
+		coldStorageDuration = int(params.ToColdStorageDurationDays) // Already in days
 	}
 
 	tableNames := []string{
 		r.logsDB + "." + r.logsLocalTableV2,
 		r.logsDB + "." + r.logsResourceLocalTableV2,
+		getLocalTableName(r.logsDB + "." + r.logsAttributeKeys),
+		getLocalTableName(r.logsDB + "." + r.logsResourceKeys),
+	}
+	distributedTableNames := []string{
+		r.logsDB + "." + r.logsTableV2,
+		r.logsDB + "." + r.logsResourceTableV2,
 	}
 
 	for _, tableName := range tableNames {
-		statusItem, err := r.checkCustomRetentionTTLStatusItem(ctx, orgID, tableName)
-		if err != nil {
+		statusItem, apiErr := r.checkCustomRetentionTTLStatusItem(ctx, orgID, tableName)
+		if apiErr != nil {
 			return nil, errorsV2.Newf(errorsV2.TypeInternal, errorsV2.CodeInternal, "error in processing custom_retention_ttl_status check sql query")
 		}
 		if statusItem.Status == constants.StatusPending {
@@ -1669,11 +1695,17 @@ func (r *ClickHouseReader) SetTTLV2(ctx context.Context, orgID string, params *m
 	queries := []string{
 		fmt.Sprintf(`ALTER TABLE %s ON CLUSTER %s MODIFY COLUMN _retention_days UInt16 DEFAULT %s`,
 			tableNames[0], r.cluster, multiIfExpr),
+		// for distributed table
+		fmt.Sprintf(`ALTER TABLE %s ON CLUSTER %s MODIFY COLUMN _retention_days UInt16 DEFAULT %s`,
+			distributedTableNames[0], r.cluster, multiIfExpr),
 	}
 
 	if len(params.ColdStorageVolume) > 0 && coldStorageDuration > 0 {
 		queries = append(queries, fmt.Sprintf(`ALTER TABLE %s ON CLUSTER %s MODIFY COLUMN _retention_days_cold UInt16 DEFAULT %d`,
 			tableNames[0], r.cluster, coldStorageDuration))
+		// for distributed table
+		queries = append(queries, fmt.Sprintf(`ALTER TABLE %s ON CLUSTER %s MODIFY COLUMN _retention_days_cold UInt16 DEFAULT %d`,
+			distributedTableNames[0], r.cluster, coldStorageDuration))
 
 		queries = append(queries, fmt.Sprintf(`ALTER TABLE %s ON CLUSTER %s MODIFY TTL toDateTime(timestamp / 1000000000) + toIntervalDay(_retention_days) DELETE, toDateTime(timestamp / 1000000000) + toIntervalDay(_retention_days_cold) TO VOLUME '%s' SETTINGS materialize_ttl_after_modify=0`,
 			tableNames[0], r.cluster, params.ColdStorageVolume))
@@ -1684,17 +1716,39 @@ func (r *ClickHouseReader) SetTTLV2(ctx context.Context, orgID string, params *m
 	resourceQueries := []string{
 		fmt.Sprintf(`ALTER TABLE %s ON CLUSTER %s MODIFY COLUMN _retention_days UInt16 DEFAULT %s`,
 			tableNames[1], r.cluster, resourceMultiIfExpr),
+		// for distributed table
+		fmt.Sprintf(`ALTER TABLE %s ON CLUSTER %s MODIFY COLUMN _retention_days UInt16 DEFAULT %s`,
+			distributedTableNames[1], r.cluster, resourceMultiIfExpr),
 	}
 
 	if len(params.ColdStorageVolume) > 0 && coldStorageDuration > 0 {
 		resourceQueries = append(resourceQueries, fmt.Sprintf(`ALTER TABLE %s ON CLUSTER %s MODIFY COLUMN _retention_days_cold UInt16 DEFAULT %d`,
 			tableNames[1], r.cluster, coldStorageDuration))
-
+		// for distributed table
+		resourceQueries = append(resourceQueries, fmt.Sprintf(`ALTER TABLE %s ON CLUSTER %s MODIFY COLUMN _retention_days_cold UInt16 DEFAULT %d`,
+			distributedTableNames[1], r.cluster, coldStorageDuration))
 		resourceQueries = append(resourceQueries, fmt.Sprintf(`ALTER TABLE %s ON CLUSTER %s MODIFY TTL toDateTime(seen_at_ts_bucket_start) + toIntervalSecond(1800) + toIntervalDay(_retention_days) DELETE, toDateTime(seen_at_ts_bucket_start) + toIntervalSecond(1800) + toIntervalDay(_retention_days_cold) TO VOLUME '%s' SETTINGS materialize_ttl_after_modify=0`,
 			tableNames[1], r.cluster, params.ColdStorageVolume))
 	}
 
 	ttlPayload[tableNames[1]] = resourceQueries
+
+	// NOTE: Since logs support custom rule based retention, that makes it difficult to identify which attributes, resource keys
+	// we need to keep, hence choosing MAX for safe side and not to create any complex solution for this.
+	maxRetentionTTL := params.DefaultTTLDays
+	for _, rule := range params.TTLConditions {
+		maxRetentionTTL = max(maxRetentionTTL, rule.TTLDays)
+	}
+
+	ttlPayload[tableNames[2]] = []string{
+		fmt.Sprintf("ALTER TABLE %s ON CLUSTER %s MODIFY TTL timestamp + toIntervalDay(%d) DELETE SETTINGS materialize_ttl_after_modify=0",
+			tableNames[2], r.cluster, maxRetentionTTL),
+	}
+
+	ttlPayload[tableNames[3]] = []string{
+		fmt.Sprintf("ALTER TABLE %s ON CLUSTER %s MODIFY TTL timestamp + toIntervalDay(%d) DELETE SETTINGS materialize_ttl_after_modify=0",
+			tableNames[3], r.cluster, maxRetentionTTL),
+	}
 
 	ttlConditionsJSON, err := json.Marshal(params.TTLConditions)
 	if err != nil {
@@ -1860,6 +1914,7 @@ func (r *ClickHouseReader) GetCustomRetentionTTL(ctx context.Context, orgID stri
 			response.DefaultTTLDays = 15
 			response.TTLConditions = []model.CustomRetentionRule{}
 			response.Status = constants.StatusFailed
+			response.ColdStorageTTLDays = -1
 			return response, nil
 		}
 
@@ -1891,13 +1946,16 @@ func (r *ClickHouseReader) GetCustomRetentionTTL(ctx context.Context, orgID stri
 			return nil, errorsV2.Newf(errorsV2.TypeInternal, errorsV2.CodeInternal, "error getting V1 TTL: %s", apiErr.Error())
 		}
 
-		// Map V1 fields to response
-		response.LogsTime = ttlResult.LogsTime
-		response.LogsMoveTime = ttlResult.LogsMoveTime
 		response.ExpectedLogsTime = ttlResult.ExpectedLogsTime
 		response.ExpectedLogsMoveTime = ttlResult.ExpectedLogsMoveTime
 		response.Status = ttlResult.Status
-		response.DefaultTTLDays = ttlResult.LogsTime / 24
+		response.ColdStorageTTLDays = -1
+		if ttlResult.LogsTime > 0 {
+			response.DefaultTTLDays = ttlResult.LogsTime / 24
+		}
+		if ttlResult.LogsMoveTime > 0 {
+			response.ColdStorageTTLDays = ttlResult.LogsMoveTime / 24
+		}
 
 		// For V1, we don't have TTL conditions
 		response.TTLConditions = []model.CustomRetentionRule{}
@@ -1925,8 +1983,8 @@ func (r *ClickHouseReader) checkCustomRetentionTTLStatusItem(ctx context.Context
 }
 
 func (r *ClickHouseReader) updateCustomRetentionTTLStatus(ctx context.Context, orgID, tableName, status string) {
-	statusItem, err := r.checkCustomRetentionTTLStatusItem(ctx, orgID, tableName)
-	if err == nil && statusItem != nil {
+	statusItem, apiErr := r.checkCustomRetentionTTLStatusItem(ctx, orgID, tableName)
+	if apiErr == nil && statusItem != nil {
 		_, dbErr := r.sqlDB.BunDB().NewUpdate().
 			Model(new(types.TTLSetting)).
 			Set("updated_at = ?", time.Now()).
@@ -2043,6 +2101,21 @@ func (r *ClickHouseReader) validateTTLConditions(ctx context.Context, ttlConditi
 func (r *ClickHouseReader) SetTTL(ctx context.Context, orgID string, params *model.TTLParams) (*model.SetTTLResponseItem, *model.ApiError) {
 	// Keep only latest 100 transactions/requests
 	r.deleteTtlTransactions(ctx, orgID, 100)
+
+	switch params.Type {
+	case constants.TraceTTL:
+		return r.setTTLTraces(ctx, orgID, params)
+	case constants.MetricsTTL:
+		return r.setTTLMetrics(ctx, orgID, params)
+	case constants.LogsTTL:
+		return r.setTTLLogs(ctx, orgID, params)
+	default:
+		return nil, &model.ApiError{Typ: model.ErrorExec, Err: fmt.Errorf("error while setting ttl. ttl type should be <metrics|traces>, got %v", params.Type)}
+	}
+
+}
+
+func (r *ClickHouseReader) setTTLMetrics(ctx context.Context, orgID string, params *model.TTLParams) (*model.SetTTLResponseItem, *model.ApiError) {
 	// uuid is used as transaction id
 	uuidWithHyphen := uuid.New()
 	uuid := strings.Replace(uuidWithHyphen.String(), "-", "", -1)
@@ -2051,95 +2124,69 @@ func (r *ClickHouseReader) SetTTL(ctx context.Context, orgID string, params *mod
 	if len(params.ColdStorageVolume) > 0 {
 		coldStorageDuration = int(params.ToColdStorageDuration)
 	}
-
-	switch params.Type {
-	case constants.TraceTTL:
-		return r.setTTLTraces(ctx, orgID, params)
-	case constants.MetricsTTL:
-		tableNames := []string{
-			signozMetricDBName + "." + signozSampleLocalTableName,
-			signozMetricDBName + "." + signozSamplesAgg5mLocalTableName,
-			signozMetricDBName + "." + signozSamplesAgg30mLocalTableName,
-			signozMetricDBName + "." + signozExpHistLocalTableName,
-			signozMetricDBName + "." + signozTSLocalTableNameV4,
-			signozMetricDBName + "." + signozTSLocalTableNameV46Hrs,
-			signozMetricDBName + "." + signozTSLocalTableNameV41Day,
-			signozMetricDBName + "." + signozTSLocalTableNameV41Week,
+	tableNames := []string{
+		signozMetricDBName + "." + signozSampleLocalTableName,
+		signozMetricDBName + "." + signozSamplesAgg5mLocalTableName,
+		signozMetricDBName + "." + signozSamplesAgg30mLocalTableName,
+		signozMetricDBName + "." + signozExpHistLocalTableName,
+		signozMetricDBName + "." + signozTSLocalTableNameV4,
+		signozMetricDBName + "." + signozTSLocalTableNameV46Hrs,
+		signozMetricDBName + "." + signozTSLocalTableNameV41Day,
+		signozMetricDBName + "." + signozTSLocalTableNameV41Week,
+	}
+	for _, tableName := range tableNames {
+		statusItem, apiErr := r.checkTTLStatusItem(ctx, orgID, tableName)
+		if apiErr != nil {
+			return nil, &model.ApiError{Typ: model.ErrorExec, Err: fmt.Errorf("error in processing ttl_status check sql query")}
 		}
-		for _, tableName := range tableNames {
-			statusItem, err := r.checkTTLStatusItem(ctx, orgID, tableName)
-			if err != nil {
-				return nil, &model.ApiError{Typ: model.ErrorExec, Err: fmt.Errorf("error in processing ttl_status check sql query")}
-			}
-			if statusItem.Status == constants.StatusPending {
-				return nil, &model.ApiError{Typ: model.ErrorConflict, Err: fmt.Errorf("TTL is already running")}
-			}
+		if statusItem.Status == constants.StatusPending {
+			return nil, &model.ApiError{Typ: model.ErrorConflict, Err: fmt.Errorf("TTL is already running")}
 		}
-		metricTTL := func(tableName string) {
-			ttl := types.TTLSetting{
-				Identifiable: types.Identifiable{
-					ID: valuer.GenerateUUID(),
-				},
-				TimeAuditable: types.TimeAuditable{
-					CreatedAt: time.Now(),
-					UpdatedAt: time.Now(),
-				},
-				TransactionID:  uuid,
-				TableName:      tableName,
-				TTL:            int(params.DelDuration),
-				Status:         constants.StatusPending,
-				ColdStorageTTL: coldStorageDuration,
-				OrgID:          orgID,
-			}
-			_, dbErr := r.
-				sqlDB.
-				BunDB().
-				NewInsert().
-				Model(&ttl).
-				Exec(ctx)
-			if dbErr != nil {
-				zap.L().Error("error in inserting to ttl_status table", zap.Error(dbErr))
-				return
-			}
-			timeColumn := "timestamp_ms"
-			if strings.Contains(tableName, "v4") || strings.Contains(tableName, "exp_hist") {
-				timeColumn = "unix_milli"
-			}
+	}
+	metricTTL := func(tableName string) {
+		ttl := types.TTLSetting{
+			Identifiable: types.Identifiable{
+				ID: valuer.GenerateUUID(),
+			},
+			TimeAuditable: types.TimeAuditable{
+				CreatedAt: time.Now(),
+				UpdatedAt: time.Now(),
+			},
+			TransactionID:  uuid,
+			TableName:      tableName,
+			TTL:            int(params.DelDuration),
+			Status:         constants.StatusPending,
+			ColdStorageTTL: coldStorageDuration,
+			OrgID:          orgID,
+		}
+		_, dbErr := r.
+			sqlDB.
+			BunDB().
+			NewInsert().
+			Model(&ttl).
+			Exec(ctx)
+		if dbErr != nil {
+			zap.L().Error("error in inserting to ttl_status table", zap.Error(dbErr))
+			return
+		}
+		timeColumn := "timestamp_ms"
+		if strings.Contains(tableName, "v4") || strings.Contains(tableName, "exp_hist") {
+			timeColumn = "unix_milli"
+		}
 
-			req := fmt.Sprintf(
-				"ALTER TABLE %v ON CLUSTER %s MODIFY TTL toDateTime(toUInt32(%s / 1000), 'UTC') + "+
-					"INTERVAL %v SECOND DELETE", tableName, r.cluster, timeColumn, params.DelDuration)
-			if len(params.ColdStorageVolume) > 0 {
-				req += fmt.Sprintf(", toDateTime(toUInt32(%s / 1000), 'UTC')"+
-					" + INTERVAL %v SECOND TO VOLUME '%s'",
-					timeColumn, params.ToColdStorageDuration, params.ColdStorageVolume)
-			}
-			err := r.setColdStorage(context.Background(), tableName, params.ColdStorageVolume)
-			if err != nil {
-				zap.L().Error("Error in setting cold storage", zap.Error(err))
-				statusItem, err := r.checkTTLStatusItem(ctx, orgID, tableName)
-				if err == nil {
-					_, dbErr := r.
-						sqlDB.
-						BunDB().
-						NewUpdate().
-						Model(new(types.TTLSetting)).
-						Set("updated_at = ?", time.Now()).
-						Set("status = ?", constants.StatusFailed).
-						Where("id = ?", statusItem.ID.StringValue()).
-						Exec(ctx)
-					if dbErr != nil {
-						zap.L().Error("Error in processing ttl_status update sql query", zap.Error(dbErr))
-						return
-					}
-				}
-				return
-			}
-			req += " SETTINGS materialize_ttl_after_modify=0"
-			zap.L().Info("Executing TTL request: ", zap.String("request", req))
-			statusItem, _ := r.checkTTLStatusItem(ctx, orgID, tableName)
-			if err := r.db.Exec(ctx, req); err != nil {
-				zap.L().Error("error while setting ttl.", zap.Error(err))
+		req := fmt.Sprintf(
+			"ALTER TABLE %v ON CLUSTER %s MODIFY TTL toDateTime(toUInt32(%s / 1000), 'UTC') + "+
+				"INTERVAL %v SECOND DELETE", tableName, r.cluster, timeColumn, params.DelDuration)
+		if len(params.ColdStorageVolume) > 0 {
+			req += fmt.Sprintf(", toDateTime(toUInt32(%s / 1000), 'UTC')"+
+				" + INTERVAL %v SECOND TO VOLUME '%s'",
+				timeColumn, params.ToColdStorageDuration, params.ColdStorageVolume)
+		}
+		err := r.setColdStorage(context.Background(), tableName, params.ColdStorageVolume)
+		if err != nil {
+			zap.L().Error("Error in setting cold storage", zap.Error(err))
+			statusItem, apiErr := r.checkTTLStatusItem(ctx, orgID, tableName)
+			if apiErr == nil {
 				_, dbErr := r.
 					sqlDB.
 					BunDB().
@@ -2153,32 +2200,46 @@ func (r *ClickHouseReader) SetTTL(ctx context.Context, orgID string, params *mod
 					zap.L().Error("Error in processing ttl_status update sql query", zap.Error(dbErr))
 					return
 				}
-				return
 			}
-			_, dbErr = r.
+			return
+		}
+		req += " SETTINGS materialize_ttl_after_modify=0"
+		zap.L().Info("Executing TTL request: ", zap.String("request", req))
+		statusItem, _ := r.checkTTLStatusItem(ctx, orgID, tableName)
+		if err := r.db.Exec(ctx, req); err != nil {
+			zap.L().Error("error while setting ttl.", zap.Error(err))
+			_, dbErr := r.
 				sqlDB.
 				BunDB().
 				NewUpdate().
 				Model(new(types.TTLSetting)).
 				Set("updated_at = ?", time.Now()).
-				Set("status = ?", constants.StatusSuccess).
+				Set("status = ?", constants.StatusFailed).
 				Where("id = ?", statusItem.ID.StringValue()).
 				Exec(ctx)
 			if dbErr != nil {
 				zap.L().Error("Error in processing ttl_status update sql query", zap.Error(dbErr))
 				return
 			}
+			return
 		}
-		for _, tableName := range tableNames {
-			go metricTTL(tableName)
+		_, dbErr = r.
+			sqlDB.
+			BunDB().
+			NewUpdate().
+			Model(new(types.TTLSetting)).
+			Set("updated_at = ?", time.Now()).
+			Set("status = ?", constants.StatusSuccess).
+			Where("id = ?", statusItem.ID.StringValue()).
+			Exec(ctx)
+		if dbErr != nil {
+			zap.L().Error("Error in processing ttl_status update sql query", zap.Error(dbErr))
+			return
 		}
-	case constants.LogsTTL:
-		return r.setTTLLogs(ctx, orgID, params)
-
-	default:
-		return nil, &model.ApiError{Typ: model.ErrorExec, Err: fmt.Errorf("error while setting ttl. ttl type should be <metrics|traces>, got %v", params.Type)}
 	}
-
+	for _, tableName := range tableNames {
+		go metricTTL(tableName)
+	}
 	return &model.SetTTLResponseItem{Message: "move ttl has been successfully set up"}, nil
 }
 
@@ -2188,10 +2249,11 @@ func (r *ClickHouseReader) deleteTtlTransactions(ctx context.Context, orgID stri
 		sqlDB.
 		BunDB().
 		NewSelect().
-		ColumnExpr("distinct(transaction_id)").
+		Column("transaction_id").
 		Model(new(types.TTLSetting)).
 		Where("org_id = ?", orgID).
-		OrderExpr("created_at DESC").
+		Group("transaction_id").
+		OrderExpr("MAX(created_at) DESC").
 		Limit(numberOfTransactionsStore).
 		Scan(ctx, &limitTransactions)
 
@@ -2232,17 +2294,17 @@ func (r *ClickHouseReader) checkTTLStatusItem(ctx context.Context, orgID string,
 	return ttl, nil
 }
 
-// setTTLQueryStatus fetches ttl_status table status from DB
-func (r *ClickHouseReader) setTTLQueryStatus(ctx context.Context, orgID string, tableNameArray []string) (string, *model.ApiError) {
+// getTTLQueryStatus fetches ttl_status table status from DB
+func (r *ClickHouseReader) getTTLQueryStatus(ctx context.Context, orgID string, tableNameArray []string) (string, *model.ApiError) {
 	failFlag := false
 	status := constants.StatusSuccess
 	for _, tableName := range tableNameArray {
-		statusItem, err := r.checkTTLStatusItem(ctx, orgID, tableName)
+		statusItem, apiErr := r.checkTTLStatusItem(ctx, orgID, tableName)
 		emptyStatusStruct := new(types.TTLSetting)
 		if statusItem == emptyStatusStruct {
 			return "", nil
 		}
-		if err != nil {
+		if apiErr != nil {
 			return "", &model.ApiError{Typ: model.ErrorExec, Err: fmt.Errorf("error in processing ttl_status check sql query")}
 		}
 		if statusItem.Status == constants.StatusPending && statusItem.UpdatedAt.Unix()-time.Now().Unix() < 3600 {
@@ -2386,20 +2448,26 @@ func (r *ClickHouseReader) GetTTL(ctx context.Context, orgID string, ttlParams *
 
 	switch ttlParams.Type {
 	case constants.TraceTTL:
-		tableNameArray := []string{signozTraceDBName + "." + signozTraceTableName, signozTraceDBName + "." + signozDurationMVTable, signozTraceDBName + "." + signozSpansTable, signozTraceDBName + "." + signozErrorIndexTable, signozTraceDBName + "." + signozUsageExplorerTable, signozTraceDBName + "." + defaultDependencyGraphTable}
-
+		tableNameArray := []string{
+			r.TraceDB + "." + r.traceTableName,
+			r.TraceDB + "." + r.traceResourceTableV3,
+			r.TraceDB + "." + signozErrorIndexTable,
+			r.TraceDB + "." + signozUsageExplorerTable,
+			r.TraceDB + "." + defaultDependencyGraphTable,
+			r.TraceDB + "." + r.traceSummaryTable,
+		}
 		tableNameArray = getLocalTableNameArray(tableNameArray)
-		status, err := r.setTTLQueryStatus(ctx, orgID, tableNameArray)
-		if err != nil {
-			return nil, err
+		status, apiErr := r.getTTLQueryStatus(ctx, orgID, tableNameArray)
+		if apiErr != nil {
+			return nil, apiErr
 		}
-		dbResp, err := getTracesTTL()
-		if err != nil {
-			return nil, err
+		dbResp, apiErr := getTracesTTL()
+		if apiErr != nil {
+			return nil, apiErr
 		}
-		ttlQuery, err := r.checkTTLStatusItem(ctx, orgID, tableNameArray[0])
-		if err != nil {
-			return nil, err
+		ttlQuery, apiErr := r.checkTTLStatusItem(ctx, orgID, tableNameArray[0])
+		if apiErr != nil {
+			return nil, apiErr
 		}
 		ttlQuery.TTL = ttlQuery.TTL / 3600 // convert to hours
 		if ttlQuery.ColdStorageTTL != -1 {
@@ -2412,17 +2480,17 @@ func (r *ClickHouseReader) GetTTL(ctx context.Context, orgID string, ttlParams *
 	case constants.MetricsTTL:
 		tableNameArray := []string{signozMetricDBName + "." + signozSampleTableName}
 		tableNameArray = getLocalTableNameArray(tableNameArray)
-		status, err := r.setTTLQueryStatus(ctx, orgID, tableNameArray)
-		if err != nil {
-			return nil, err
+		status, apiErr := r.getTTLQueryStatus(ctx, orgID, tableNameArray)
+		if apiErr != nil {
+			return nil, apiErr
 		}
-		dbResp, err := getMetricsTTL()
-		if err != nil {
-			return nil, err
+		dbResp, apiErr := getMetricsTTL()
+		if apiErr != nil {
+			return nil, apiErr
 		}
-		ttlQuery, err := r.checkTTLStatusItem(ctx, orgID, tableNameArray[0])
-		if err != nil {
-			return nil, err
+		ttlQuery, apiErr := r.checkTTLStatusItem(ctx, orgID, tableNameArray[0])
+		if apiErr != nil {
+			return nil, apiErr
 		}
 		ttlQuery.TTL = ttlQuery.TTL / 3600 // convert to hours
 		if ttlQuery.ColdStorageTTL != -1 {
@@ -2435,17 +2503,17 @@ func (r *ClickHouseReader) GetTTL(ctx context.Context, orgID string, ttlParams *
 	case constants.LogsTTL:
 		tableNameArray := []string{r.logsDB + "." + r.logsTableName}
 		tableNameArray = getLocalTableNameArray(tableNameArray)
-		status, err := r.setTTLQueryStatus(ctx, orgID, tableNameArray)
-		if err != nil {
-			return nil, err
+		status, apiErr := r.getTTLQueryStatus(ctx, orgID, tableNameArray)
+		if apiErr != nil {
+			return nil, apiErr
 		}
-		dbResp, err := getLogsTTL()
-		if err != nil {
-			return nil, err
+		dbResp, apiErr := getLogsTTL()
+		if apiErr != nil {
+			return nil, apiErr
 		}
-		ttlQuery, err := r.checkTTLStatusItem(ctx, orgID, tableNameArray[0])
-		if err != nil {
-			return nil, err
+		ttlQuery, apiErr := r.checkTTLStatusItem(ctx, orgID, tableNameArray[0])
+		if apiErr != nil {
+			return nil, apiErr
 		}
 		ttlQuery.TTL = ttlQuery.TTL / 3600 // convert to hours
 		if ttlQuery.ColdStorageTTL != -1 {
@@ -2628,19 +2696,19 @@ func (r *ClickHouseReader) GetNextPrevErrorIDs(ctx context.Context, queryParams 
 		zap.L().Error("errorId missing from params")
 		return nil, &model.ApiError{Typ: model.ErrorBadData, Err: fmt.Errorf("ErrorID missing from params")}
 	}
-	var err *model.ApiError
+	var apiErr *model.ApiError
 	getNextPrevErrorIDsResponse := model.NextPrevErrorIDs{
 		GroupID: queryParams.GroupID,
 	}
-	getNextPrevErrorIDsResponse.NextErrorID, getNextPrevErrorIDsResponse.NextTimestamp, err = r.getNextErrorID(ctx, queryParams)
-	if err != nil {
-		zap.L().Error("Unable to get next error ID due to err: ", zap.Error(err))
-		return nil, err
+	getNextPrevErrorIDsResponse.NextErrorID, getNextPrevErrorIDsResponse.NextTimestamp, apiErr = r.getNextErrorID(ctx, queryParams)
+	if apiErr != nil {
+		zap.L().Error("Unable to get next error ID due to err: ", zap.Error(apiErr))
+		return nil, apiErr
 	}
-	getNextPrevErrorIDsResponse.PrevErrorID, getNextPrevErrorIDsResponse.PrevTimestamp, err = r.getPrevErrorID(ctx, queryParams)
-	if err != nil {
-		zap.L().Error("Unable to get prev error ID due to err: ", zap.Error(err))
-		return nil, err
+	getNextPrevErrorIDsResponse.PrevErrorID, getNextPrevErrorIDsResponse.PrevTimestamp, apiErr = r.getPrevErrorID(ctx, queryParams)
+	if apiErr != nil {
+		zap.L().Error("Unable to get prev error ID due to err: ", zap.Error(apiErr))
+		return nil, apiErr
 	}
 	return &getNextPrevErrorIDsResponse, nil
 
@@ -6193,17 +6261,6 @@ LIMIT 40`, // added rand to get diff value every time we run this query
 	return fingerprints, nil
 }
 
-func (r *ClickHouseReader) DeleteMetricsMetadata(ctx context.Context, orgID valuer.UUID, metricName string) *model.ApiError {
-	delQuery := fmt.Sprintf(`ALTER TABLE %s.%s DELETE WHERE metric_name = ?;`, signozMetricDBName, signozUpdatedMetricsMetadataLocalTable)
-	valueCtx := context.WithValue(ctx, "clickhouse_max_threads", constants.MetricsExplorerClickhouseThreads)
-	err := r.db.Exec(valueCtx, delQuery, metricName)
-	if err != nil {
-		return &model.ApiError{Typ: "ClickHouseError", Err: err}
-	}
-	r.cache.Delete(ctx, orgID, constants.UpdatedMetricsMetadataCachePrefix+metricName)
-	return nil
-}
-
 func (r *ClickHouseReader) UpdateMetricsMetadata(ctx context.Context, orgID valuer.UUID, req *model.UpdateMetricsMetadata) *model.ApiError {
 	if req.MetricType == v3.MetricTypeHistogram {
 		labels := []string{"le"}
@@ -6233,10 +6290,7 @@ func (r *ClickHouseReader) UpdateMetricsMetadata(ctx context.Context, orgID valu
 		}
 	}
 
-	apiErr := r.DeleteMetricsMetadata(ctx, orgID, req.MetricName)
-	if apiErr != nil {
-		return apiErr
-	}
+	// Insert new metadata (keeping history of all updates)
 	insertQuery := fmt.Sprintf(`INSERT INTO %s.%s (metric_name, temporality, is_monotonic, type, description, unit, created_at)
 VALUES ( ?, ?, ?, ?, ?, ?, ?);`, signozMetricDBName, signozUpdatedMetricsMetadataTable)
 	valueCtx := context.WithValue(ctx, "clickhouse_max_threads", constants.MetricsExplorerClickhouseThreads)
@@ -6293,7 +6347,7 @@ func (r *ClickHouseReader) GetUpdatedMetricsMetadata(ctx context.Context, orgID 
 	for _, metricName := range metricNames {
 		metadata := new(model.UpdateMetricsMetadata)
 		cacheKey := constants.UpdatedMetricsMetadataCachePrefix + metricName
-		err := r.cache.Get(ctx, orgID, cacheKey, metadata, true)
+		err := r.cache.Get(ctx, orgID, cacheKey, metadata)
 		if err == nil {
 			cachedMetadata[metricName] = metadata
 		} else {
@@ -6305,9 +6359,19 @@ func (r *ClickHouseReader) GetUpdatedMetricsMetadata(ctx context.Context, orgID 
 	var stillMissing []string
 	if len(missingMetrics) > 0 {
 		metricList := "'" + strings.Join(missingMetrics, "', '") + "'"
-		query := fmt.Sprintf(`SELECT metric_name, type, description, temporality, is_monotonic, unit
-			FROM %s.%s 
-			WHERE metric_name IN (%s);`, signozMetricDBName, signozUpdatedMetricsMetadataTable, metricList)
+		query := fmt.Sprintf(`SELECT 
+						metric_name,
+						argMax(type, created_at) AS type,
+						argMax(description, created_at) AS description,
+						argMax(temporality, created_at) AS temporality,
+						argMax(is_monotonic, created_at) AS is_monotonic,
+						argMax(unit, created_at) AS unit
+					FROM %s.%s 
+					WHERE metric_name IN (%s)
+					GROUP BY metric_name;`,
+			signozMetricDBName,
+			signozUpdatedMetricsMetadataTable,
+			metricList)
 
 		valueCtx := context.WithValue(ctx, "clickhouse_max_threads", constants.MetricsExplorerClickhouseThreads)
 		rows, err := r.db.Query(valueCtx, query)
@@ -6508,7 +6572,7 @@ func (r *ClickHouseReader) GetNormalizedStatus(
 	uncached := make([]string, 0, len(metricNames))
 	for _, m := range metricNames {
 		var status model.MetricsNormalizedMap
-		if err := r.cache.Get(ctx, orgID, buildKey(m), &status, true); err == nil {
+		if err := r.cache.Get(ctx, orgID, buildKey(m), &status); err == nil {
 			result[m] = status.IsUnNormalized
 		} else {
 			uncached = append(uncached, m)

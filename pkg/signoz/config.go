@@ -2,7 +2,6 @@ package signoz
 
 import (
 	"context"
-	"fmt"
 	"log/slog"
 	"net/url"
 	"os"
@@ -16,9 +15,13 @@ import (
 	"github.com/SigNoz/signoz/pkg/cache"
 	"github.com/SigNoz/signoz/pkg/config"
 	"github.com/SigNoz/signoz/pkg/emailing"
+	"github.com/SigNoz/signoz/pkg/errors"
 	"github.com/SigNoz/signoz/pkg/factory"
+	"github.com/SigNoz/signoz/pkg/flagger"
 	"github.com/SigNoz/signoz/pkg/gateway"
+	"github.com/SigNoz/signoz/pkg/global"
 	"github.com/SigNoz/signoz/pkg/instrumentation"
+	"github.com/SigNoz/signoz/pkg/modules/metricsexplorer"
 	"github.com/SigNoz/signoz/pkg/prometheus"
 	"github.com/SigNoz/signoz/pkg/querier"
 	"github.com/SigNoz/signoz/pkg/ruler"
@@ -29,6 +32,8 @@ import (
 	"github.com/SigNoz/signoz/pkg/sqlstore"
 	"github.com/SigNoz/signoz/pkg/statsreporter"
 	"github.com/SigNoz/signoz/pkg/telemetrystore"
+	"github.com/SigNoz/signoz/pkg/tokenizer"
+	"github.com/SigNoz/signoz/pkg/valuer"
 	"github.com/SigNoz/signoz/pkg/version"
 	"github.com/SigNoz/signoz/pkg/web"
 	"github.com/spf13/cobra"
@@ -36,6 +41,9 @@ import (
 
 // Config defines the entire input configuration of signoz.
 type Config struct {
+	// Global config
+	Global global.Config `mapstructure:"global"`
+
 	// Version config
 	Version version.Config `mapstructure:"version"`
 
@@ -92,6 +100,15 @@ type Config struct {
 
 	// Gateway config
 	Gateway gateway.Config `mapstructure:"gateway"`
+
+	// Tokenizer config
+	Tokenizer tokenizer.Config `mapstructure:"tokenizer"`
+
+	// MetricsExplorer config
+	MetricsExplorer metricsexplorer.Config `mapstructure:"metricsexplorer"`
+
+	// Flagger config
+	Flagger flagger.Config `mapstructure:"flagger"`
 }
 
 // DeprecatedFlags are the flags that are deprecated and scheduled for removal.
@@ -126,12 +143,13 @@ func (df *DeprecatedFlags) RegisterFlags(cmd *cobra.Command) {
 	_ = cmd.Flags().MarkDeprecated("flux-interval", "use SIGNOZ_QUERIER_FLUX__INTERVAL instead")
 	_ = cmd.Flags().MarkDeprecated("flux-interval-for-trace-detail", "use SIGNOZ_QUERIER_FLUX__INTERVAL instead")
 	_ = cmd.Flags().MarkDeprecated("cluster", "use SIGNOZ_TELEMETRYSTORE_CLICKHOUSE_CLUSTER instead")
-	_ = cmd.Flags().MarkDeprecated("prefer-span-metrics", "use USE_SPAN_METRICS instead")
+	_ = cmd.Flags().MarkDeprecated("prefer-span-metrics", "use SIGNOZ_FLAGGER_CONFIG_BOOLEAN_USE__SPAN__METRICS instead")
 	_ = cmd.Flags().MarkDeprecated("gateway-url", "use SIGNOZ_GATEWAY_URL instead")
 }
 
 func NewConfig(ctx context.Context, logger *slog.Logger, resolverConfig config.ResolverConfig, deprecatedFlags DeprecatedFlags) (Config, error) {
 	configFactories := []factory.ConfigFactory{
+		global.NewConfigFactory(),
 		version.NewConfigFactory(),
 		instrumentation.NewConfigFactory(),
 		analytics.NewConfigFactory(),
@@ -150,6 +168,9 @@ func NewConfig(ctx context.Context, logger *slog.Logger, resolverConfig config.R
 		sharder.NewConfigFactory(),
 		statsreporter.NewConfigFactory(),
 		gateway.NewConfigFactory(),
+		tokenizer.NewConfigFactory(),
+		metricsexplorer.NewConfigFactory(),
+		flagger.NewConfigFactory(),
 	}
 
 	conf, err := config.New(ctx, resolverConfig, configFactories)
@@ -176,11 +197,11 @@ func validateConfig(config Config) error {
 	for i := 0; i < rvConfig.NumField(); i++ {
 		factoryConfig, ok := rvConfig.Field(i).Interface().(factory.Config)
 		if !ok {
-			return fmt.Errorf("%q is not of type \"factory.Config\"", rvConfig.Type().Field(i).Name)
+			return errors.NewInvalidInputf(errors.CodeInvalidInput, "%q is not of type \"factory.Config\"", rvConfig.Type().Field(i).Name)
 		}
 
 		if err := factoryConfig.Validate(); err != nil {
-			return fmt.Errorf("failed to validate config %q: %w", rvConfig.Type().Field(i).Tag.Get("mapstructure"), err)
+			return errors.WrapInvalidInputf(err, errors.CodeInvalidInput, "failed to validate config %q", rvConfig.Type().Field(i).Tag.Get("mapstructure"))
 		}
 	}
 
@@ -311,7 +332,19 @@ func mergeAndEnsureBackwardCompatibility(ctx context.Context, logger *slog.Logge
 	}
 
 	if deprecatedFlags.PreferSpanMetrics {
-		logger.WarnContext(ctx, "[Deprecated] flag --prefer-span-metrics is deprecated and scheduled for removal. Please use USE_SPAN_METRICS instead.")
+		logger.WarnContext(ctx, "[Deprecated] flag --prefer-span-metrics is deprecated and scheduled for removal. Please use SIGNOZ_FLAGGER_CONFIG_BOOLEAN_USE__SPAN__METRICS instead.")
+		if config.Flagger.Config.Boolean == nil {
+			config.Flagger.Config.Boolean = make(map[string]bool)
+		}
+		config.Flagger.Config.Boolean[flagger.FeatureUseSpanMetrics.String()] = deprecatedFlags.PreferSpanMetrics
+	}
+
+	if os.Getenv("USE_SPAN_METRICS") != "" {
+		logger.WarnContext(ctx, "[Deprecated] env USE_SPAN_METRICS is deprecated and scheduled for removal. Please use SIGNOZ_FLAGGER_CONFIG_BOOLEAN_USE__SPAN__METRICS instead.")
+		if config.Flagger.Config.Boolean == nil {
+			config.Flagger.Config.Boolean = make(map[string]bool)
+		}
+		config.Flagger.Config.Boolean[flagger.FeatureUseSpanMetrics.String()] = os.Getenv("USE_SPAN_METRICS") == "true"
 	}
 
 	if deprecatedFlags.GatewayUrl != "" {
@@ -323,4 +356,40 @@ func mergeAndEnsureBackwardCompatibility(ctx context.Context, logger *slog.Logge
 			config.Gateway.URL = u
 		}
 	}
+
+	if os.Getenv("SIGNOZ_JWT_SECRET") != "" {
+		logger.WarnContext(ctx, "[Deprecated] env SIGNOZ_JWT_SECRET is deprecated and scheduled for removal. Please use SIGNOZ_TOKENIZER_JWT_SECRET instead.")
+		config.Tokenizer.JWT.Secret = os.Getenv("SIGNOZ_JWT_SECRET")
+	}
+
+	if os.Getenv("KAFKA_SPAN_EVAL") != "" {
+		logger.WarnContext(ctx, "[Deprecated] env KAFKA_SPAN_EVAL is deprecated and scheduled for removal. Please use SIGNOZ_FLAGGER_CONFIG_BOOLEAN_KAFKA__SPAN__EVAL instead.")
+		if config.Flagger.Config.Boolean == nil {
+			config.Flagger.Config.Boolean = make(map[string]bool)
+		}
+		config.Flagger.Config.Boolean[flagger.FeatureKafkaSpanEval.String()] = os.Getenv("KAFKA_SPAN_EVAL") == "true"
+	}
+
+	if os.Getenv("INTERPOLATION_ENABLED") != "" {
+		logger.WarnContext(ctx, "[Deprecated] env INTERPOLATION_ENABLED is deprecated and scheduled for removal. Please use SIGNOZ_FLAGGER_CONFIG_BOOLEAN_INTERPOLATION__ENABLED instead.")
+		if config.Flagger.Config.Boolean == nil {
+			config.Flagger.Config.Boolean = make(map[string]bool)
+		}
+		config.Flagger.Config.Boolean[flagger.FeatureInterpolationEnabled.String()] = os.Getenv("INTERPOLATION_ENABLED") == "true"
+	}
+}
+
+func (config Config) Collect(_ context.Context, _ valuer.UUID) (map[string]any, error) {
+	stats := make(map[string]any)
+
+	// SQL Store Config Stats
+	stats["config.sqlstore.provider"] = config.SQLStore.Provider
+
+	// Tokenizer Config Stats
+	stats["config.tokenizer.provider"] = config.Tokenizer.Provider
+
+	// Cache Config Stats
+	stats["config.cache.provider"] = config.Cache.Provider
+
+	return stats, nil
 }

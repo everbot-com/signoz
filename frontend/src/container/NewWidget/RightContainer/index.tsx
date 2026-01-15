@@ -12,14 +12,21 @@ import {
 	Switch,
 	Typography,
 } from 'antd';
+import { PrecisionOption, PrecisionOptionsEnum } from 'components/Graph/types';
 import TimePreference from 'components/TimePreferenceDropDown';
 import { PANEL_TYPES, PanelDisplay } from 'constants/queryBuilder';
 import GraphTypes, {
 	ItemsProps,
-} from 'container/NewDashboard/ComponentsSlider/menuItems';
+} from 'container/DashboardContainer/ComponentsSlider/menuItems';
 import useCreateAlerts from 'hooks/queryBuilder/useCreateAlerts';
 import { useQueryBuilder } from 'hooks/queryBuilder/useQueryBuilder';
-import { ConciergeBell, LineChart, Plus, Spline } from 'lucide-react';
+import {
+	ConciergeBell,
+	LineChart,
+	Plus,
+	Spline,
+	SquareArrowOutUpRight,
+} from 'lucide-react';
 import { useDashboard } from 'providers/Dashboard/Dashboard';
 import {
 	Dispatch,
@@ -48,6 +55,7 @@ import {
 	panelTypeVsColumnUnitPreferences,
 	panelTypeVsContextLinks,
 	panelTypeVsCreateAlert,
+	panelTypeVsDecimalPrecision,
 	panelTypeVsFillSpan,
 	panelTypeVsLegendColors,
 	panelTypeVsLegendPosition,
@@ -59,11 +67,11 @@ import {
 	panelTypeVsYAxisUnit,
 } from './constants';
 import ContextLinks from './ContextLinks';
+import DashboardYAxisUnitSelectorWrapper from './DashboardYAxisUnitSelectorWrapper';
 import LegendColors from './LegendColors/LegendColors';
 import ThresholdSelector from './Threshold/ThresholdSelector';
 import { ThresholdProps } from './Threshold/types';
 import { timePreferance } from './timeItems';
-import YAxisUnitSelector from './YAxisUnitSelector';
 
 const { TextArea } = Input;
 const { Option } = Select;
@@ -95,6 +103,8 @@ function RightContainer({
 	selectedTime,
 	yAxisUnit,
 	setYAxisUnit,
+	decimalPrecision,
+	setDecimalPrecision,
 	setGraphHandler,
 	thresholds,
 	combineHistogram,
@@ -119,6 +129,7 @@ function RightContainer({
 	contextLinks,
 	setContextLinks,
 	enableDrillDown = false,
+	isNewDashboard,
 }: RightContainerProps): JSX.Element {
 	const { selectedDashboard } = useDashboard();
 	const [inputValue, setInputValue] = useState(title);
@@ -136,11 +147,7 @@ function RightContainer({
 	const selectedGraphType =
 		GraphTypes.find((e) => e.name === selectedGraph)?.display || '';
 
-	const onCreateAlertsHandler = useCreateAlerts(
-		selectedWidget,
-		'panelView',
-		thresholds,
-	);
+	const onCreateAlertsHandler = useCreateAlerts(selectedWidget, 'panelView');
 
 	const allowThreshold = panelTypeVsThreshold[selectedGraph];
 	const allowSoftMinMax = panelTypeVsSoftMinMax[selectedGraph];
@@ -160,6 +167,7 @@ function RightContainer({
 		panelTypeVsColumnUnitPreferences[selectedGraph];
 	const allowContextLinks =
 		panelTypeVsContextLinks[selectedGraph] && enableDrillDown;
+	const allowDecimalPrecision = panelTypeVsDecimalPrecision[selectedGraph];
 
 	const { currentQuery } = useQueryBuilder();
 
@@ -341,11 +349,12 @@ function RightContainer({
 					<ColumnUnitSelector
 						columnUnits={columnUnits}
 						setColumnUnits={setColumnUnits}
+						isNewDashboard={isNewDashboard}
 					/>
 				)}
 
 				{allowYAxisUnit && (
-					<YAxisUnitSelector
+					<DashboardYAxisUnitSelectorWrapper
 						onSelect={setYAxisUnit}
 						value={yAxisUnit || ''}
 						fieldLabel={
@@ -354,8 +363,34 @@ function RightContainer({
 								? 'Unit'
 								: 'Y Axis Unit'
 						}
+						// Only update the y-axis unit value automatically in create mode
+						shouldUpdateYAxisUnit={isNewDashboard}
 					/>
 				)}
+
+				{allowDecimalPrecision && (
+					<section className="decimal-precision-selector">
+						<Typography.Text className="typography">
+							Decimal Precision
+						</Typography.Text>
+						<Select
+							options={[
+								{ label: '0 decimals', value: PrecisionOptionsEnum.ZERO },
+								{ label: '1 decimal', value: PrecisionOptionsEnum.ONE },
+								{ label: '2 decimals', value: PrecisionOptionsEnum.TWO },
+								{ label: '3 decimals', value: PrecisionOptionsEnum.THREE },
+								{ label: '4 decimals', value: PrecisionOptionsEnum.FOUR },
+								{ label: 'Full Precision', value: PrecisionOptionsEnum.FULL },
+							]}
+							value={decimalPrecision}
+							style={{ width: '100%' }}
+							className="panel-type-select"
+							defaultValue={PrecisionOptionsEnum.TWO}
+							onChange={(val: PrecisionOption): void => setDecimalPrecision(val)}
+						/>
+					</section>
+				)}
+
 				{allowSoftMinMax && (
 					<section className="soft-min-max">
 						<section className="container">
@@ -501,6 +536,7 @@ function RightContainer({
 					<div className="left-section">
 						<ConciergeBell size={14} className="bell-icon" />
 						<Typography.Text className="alerts-text">Alerts</Typography.Text>
+						<SquareArrowOutUpRight size={10} className="info-icon" />
 					</div>
 					<Plus size={14} className="plus-icon" />
 				</section>
@@ -531,7 +567,7 @@ function RightContainer({
 	);
 }
 
-interface RightContainerProps {
+export interface RightContainerProps {
 	title: string;
 	setTitle: Dispatch<SetStateAction<string>>;
 	description: string;
@@ -553,6 +589,8 @@ interface RightContainerProps {
 	setBucketWidth: Dispatch<SetStateAction<number>>;
 	setBucketCount: Dispatch<SetStateAction<number>>;
 	setYAxisUnit: Dispatch<SetStateAction<string>>;
+	decimalPrecision: PrecisionOption;
+	setDecimalPrecision: Dispatch<SetStateAction<PrecisionOption>>;
 	setGraphHandler: (type: PANEL_TYPES) => void;
 	thresholds: ThresholdProps[];
 	setThresholds: Dispatch<SetStateAction<ThresholdProps[]>>;
@@ -578,6 +616,7 @@ interface RightContainerProps {
 	contextLinks: ContextLinksData;
 	setContextLinks: Dispatch<SetStateAction<ContextLinksData>>;
 	enableDrillDown?: boolean;
+	isNewDashboard: boolean;
 }
 
 RightContainer.defaultProps = {

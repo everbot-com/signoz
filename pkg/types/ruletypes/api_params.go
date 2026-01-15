@@ -15,6 +15,8 @@ import (
 	"github.com/SigNoz/signoz/pkg/query-service/utils/times"
 	"github.com/SigNoz/signoz/pkg/query-service/utils/timestamp"
 	"github.com/SigNoz/signoz/pkg/types/alertmanagertypes"
+
+	"github.com/prometheus/alertmanager/config"
 )
 
 type AlertType string
@@ -65,21 +67,97 @@ type PostableRule struct {
 }
 
 type NotificationSettings struct {
-	NotificationGroupBy []string           `json:"notificationGroupBy,omitempty"`
-	ReNotifyInterval    Duration           `json:"renotify,omitempty"`
-	AlertStates         []model.AlertState `json:"alertStates,omitempty"`
+	GroupBy   []string `json:"groupBy,omitempty"`
+	Renotify  Renotify `json:"renotify,omitempty"`
+	UsePolicy bool     `json:"usePolicy,omitempty"`
+	// NewGroupEvalDelay is the grace period for new series to be excluded from alerts evaluation
+	NewGroupEvalDelay *Duration `json:"newGroupEvalDelay,omitempty"`
+}
+
+type Renotify struct {
+	Enabled          bool               `json:"enabled"`
+	ReNotifyInterval Duration           `json:"interval,omitempty"`
+	AlertStates      []model.AlertState `json:"alertStates,omitempty"`
 }
 
 func (ns *NotificationSettings) GetAlertManagerNotificationConfig() alertmanagertypes.NotificationConfig {
-	var renotifyInterval Duration
-	var noDataRenotifyInterval Duration
-	if slices.Contains(ns.AlertStates, model.StateNoData) {
-		noDataRenotifyInterval = ns.ReNotifyInterval
+	var renotifyInterval time.Duration
+	var noDataRenotifyInterval time.Duration
+	if ns.Renotify.Enabled {
+		if slices.Contains(ns.Renotify.AlertStates, model.StateNoData) {
+			noDataRenotifyInterval = time.Duration(ns.Renotify.ReNotifyInterval)
+		}
+		if slices.Contains(ns.Renotify.AlertStates, model.StateFiring) {
+			renotifyInterval = time.Duration(ns.Renotify.ReNotifyInterval)
+		}
+	} else {
+		renotifyInterval = 8760 * time.Hour //1 year for no renotify substitute
+		noDataRenotifyInterval = 8760 * time.Hour
 	}
-	if slices.Contains(ns.AlertStates, model.StateFiring) {
-		renotifyInterval = ns.ReNotifyInterval
+	return alertmanagertypes.NewNotificationConfig(ns.GroupBy, renotifyInterval, noDataRenotifyInterval, ns.UsePolicy)
+}
+
+func (r *PostableRule) GetRuleRouteRequest(ruleId string) ([]*alertmanagertypes.PostableRoutePolicy, error) {
+	threshold, err := r.RuleCondition.Thresholds.GetRuleThreshold()
+	if err != nil {
+		return nil, err
 	}
-	return alertmanagertypes.NewNotificationConfig(ns.NotificationGroupBy, time.Duration(renotifyInterval), time.Duration(noDataRenotifyInterval))
+	receivers := threshold.GetRuleReceivers()
+	routeRequests := make([]*alertmanagertypes.PostableRoutePolicy, 0)
+	for _, receiver := range receivers {
+		expression := fmt.Sprintf(`%s == "%s" && %s == "%s"`, LabelThresholdName, receiver.Name, LabelRuleId, ruleId)
+		routeRequests = append(routeRequests, &alertmanagertypes.PostableRoutePolicy{
+			Expression:     expression,
+			ExpressionKind: alertmanagertypes.RuleBasedExpression,
+			Channels:       receiver.Channels,
+			Name:           ruleId,
+			Description:    fmt.Sprintf("Auto-generated route for rule %s", ruleId),
+			Tags:           []string{"auto-generated", "rule-based"},
+		})
+	}
+	return routeRequests, nil
+}
+
+func (r *PostableRule) GetInhibitRules(ruleId string) ([]config.InhibitRule, error) {
+	threshold, err := r.RuleCondition.Thresholds.GetRuleThreshold()
+	if err != nil {
+		return nil, err
+	}
+	var groups []string
+	if r.NotificationSettings != nil {
+		for k := range r.NotificationSettings.GetAlertManagerNotificationConfig().NotificationGroup {
+			groups = append(groups, string(k))
+		}
+	}
+	receivers := threshold.GetRuleReceivers()
+	var inhibitRules []config.InhibitRule
+	for i := 0; i < len(receivers)-1; i++ {
+		rule := config.InhibitRule{
+			SourceMatchers: config.Matchers{
+				{
+					Name:  LabelThresholdName,
+					Value: receivers[i].Name,
+				},
+				{
+					Name:  LabelRuleId,
+					Value: ruleId,
+				},
+			},
+			TargetMatchers: config.Matchers{
+				{
+					Name:  LabelThresholdName,
+					Value: receivers[i+1].Name,
+				},
+				{
+					Name:  LabelRuleId,
+					Value: ruleId,
+				},
+			},
+			Equal: groups,
+		}
+		inhibitRules = append(inhibitRules, rule)
+	}
+	return inhibitRules, nil
 }
 
 func (ns *NotificationSettings) UnmarshalJSON(data []byte) error {
@@ -95,15 +173,18 @@ func (ns *NotificationSettings) UnmarshalJSON(data []byte) error {
 	}
 
 	// Validate states after unmarshaling
-	for _, state := range ns.AlertStates {
+	for _, state := range ns.Renotify.AlertStates {
 		if state != model.StateFiring && state != model.StateNoData {
-			return fmt.Errorf("invalid alert state: %s", state)
+			return signozError.NewInvalidInputf(signozError.CodeInvalidInput, "invalid alert state: %s", state)
+
 		}
 	}
 	return nil
 }
 
-func (r *PostableRule) processRuleDefaults() error {
+// processRuleDefaults applies the default values
+// for the rule options that are blank or unset.
+func (r *PostableRule) processRuleDefaults() {
 
 	if r.SchemaVersion == "" {
 		r.SchemaVersion = DefaultSchemaVersion
@@ -118,11 +199,12 @@ func (r *PostableRule) processRuleDefaults() error {
 	}
 
 	if r.RuleCondition != nil {
-		if r.RuleCondition.CompositeQuery.QueryType == v3.QueryTypeBuilder {
+		switch r.RuleCondition.CompositeQuery.QueryType {
+		case v3.QueryTypeBuilder:
 			if r.RuleType == "" {
 				r.RuleType = RuleTypeThreshold
 			}
-		} else if r.RuleCondition.CompositeQuery.QueryType == v3.QueryTypePromQL {
+		case v3.QueryTypePromQL:
 			r.RuleType = RuleTypeProm
 		}
 
@@ -131,6 +213,7 @@ func (r *PostableRule) processRuleDefaults() error {
 				q.Expression = qLabel
 			}
 		}
+
 		//added alerts v2 fields
 		if r.SchemaVersion == DefaultSchemaVersion {
 			thresholdName := CriticalThresholdName
@@ -139,23 +222,39 @@ func (r *PostableRule) processRuleDefaults() error {
 					thresholdName = severity
 				}
 			}
+
+			// For anomaly detection with ValueIsBelow, negate the target
+			targetValue := r.RuleCondition.Target
+			if r.RuleType == RuleTypeAnomaly && r.RuleCondition.CompareOp == ValueIsBelow && targetValue != nil {
+				negated := -1 * *targetValue
+				targetValue = &negated
+			}
+
 			thresholdData := RuleThresholdData{
 				Kind: BasicThresholdKind,
 				Spec: BasicRuleThresholds{{
 					Name:        thresholdName,
-					RuleUnit:    r.RuleCondition.CompositeQuery.Unit,
 					TargetUnit:  r.RuleCondition.TargetUnit,
-					TargetValue: r.RuleCondition.Target,
+					TargetValue: targetValue,
 					MatchType:   r.RuleCondition.MatchType,
 					CompareOp:   r.RuleCondition.CompareOp,
+					Channels:    r.PreferredChannels,
 				}},
 			}
 			r.RuleCondition.Thresholds = &thresholdData
 			r.Evaluation = &EvaluationEnvelope{RollingEvaluation, RollingWindow{EvalWindow: r.EvalWindow, Frequency: r.Frequency}}
+			r.NotificationSettings = &NotificationSettings{
+				Renotify: Renotify{
+					Enabled:          true,
+					ReNotifyInterval: Duration(4 * time.Hour),
+					AlertStates:      []model.AlertState{model.StateFiring},
+				},
+			}
+			if r.RuleCondition.AlertOnAbsent {
+				r.NotificationSettings.Renotify.AlertStates = append(r.NotificationSettings.Renotify.AlertStates, model.StateNoData)
+			}
 		}
 	}
-
-	return r.Validate()
 }
 
 func (r *PostableRule) MarshalJSON() ([]byte, error) {
@@ -170,6 +269,7 @@ func (r *PostableRule) MarshalJSON() ([]byte, error) {
 		}
 		aux.Evaluation = nil
 		aux.SchemaVersion = ""
+		aux.NotificationSettings = nil
 		return json.Marshal(aux)
 	default:
 		copyStruct := *r
@@ -184,7 +284,8 @@ func (r *PostableRule) UnmarshalJSON(bytes []byte) error {
 	if err := json.Unmarshal(bytes, aux); err != nil {
 		return signozError.NewInvalidInputf(signozError.CodeInvalidInput, "failed to parse json: %v", err)
 	}
-	return r.processRuleDefaults()
+	r.processRuleDefaults()
+	return r.validate()
 }
 
 func isValidLabelName(ln string) bool {
@@ -192,7 +293,7 @@ func isValidLabelName(ln string) bool {
 		return false
 	}
 	for i, b := range ln {
-		if !((b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || b == '_' || (b >= '0' && b <= '9' && i > 0)) {
+		if !((b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || b == '_' || b == '.' || (b >= '0' && b <= '9' && i > 0)) {
 			return false
 		}
 	}
@@ -242,17 +343,16 @@ func isAllQueriesDisabled(compositeQuery *v3.CompositeQuery) bool {
 	return true
 }
 
-func (r *PostableRule) Validate() error {
+func (r *PostableRule) validate() error {
 
 	var errs []error
 
 	if r.RuleCondition == nil {
 		// will get panic if we try to access CompositeQuery, so return here
 		return signozError.NewInvalidInputf(signozError.CodeInvalidInput, "rule condition is required")
-	} else {
-		if r.RuleCondition.CompositeQuery == nil {
-			errs = append(errs, signozError.NewInvalidInputf(signozError.CodeInvalidInput, "composite metric query is required"))
-		}
+	}
+	if r.RuleCondition.CompositeQuery == nil {
+		errs = append(errs, signozError.NewInvalidInputf(signozError.CodeInvalidInput, "composite query is required"))
 	}
 
 	if isAllQueriesDisabled(r.RuleCondition.CompositeQuery) {
@@ -347,6 +447,7 @@ func (g *GettableRule) MarshalJSON() ([]byte, error) {
 		}
 		aux.Evaluation = nil
 		aux.SchemaVersion = ""
+		aux.NotificationSettings = nil
 		return json.Marshal(aux)
 	default:
 		copyStruct := *g

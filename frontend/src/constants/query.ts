@@ -50,4 +50,7 @@ export enum QueryParams {
 	tab = 'tab',
 	thresholds = 'thresholds',
 	selectedExplorerView = 'selectedExplorerView',
+	variables = 'variables',
+	version = 'version',
+	showNewCreateAlertsPage = 'showNewCreateAlertsPage',
 }

@@ -20,7 +20,9 @@ function RoutingPolicies(): JSX.Element {
 		selectedRoutingPolicy,
 		routingPoliciesData,
 		isLoadingRoutingPolicies,
+		isFetchingRoutingPolicies,
 		isErrorRoutingPolicies,
+		refetchRoutingPolicies,
 		// Channels
 		channels,
 		isLoadingChannels,
@@ -84,10 +86,13 @@ function RoutingPolicies(): JSX.Element {
 				<br />
 				<RoutingPolicyList
 					routingPolicies={routingPoliciesData}
+					refetchRoutingPolicies={refetchRoutingPolicies}
+					isRoutingPoliciesFetching={isFetchingRoutingPolicies}
 					isRoutingPoliciesLoading={isLoadingRoutingPolicies}
 					isRoutingPoliciesError={isErrorRoutingPolicies}
 					handlePolicyDetailsModalOpen={handlePolicyDetailsModalOpen}
 					handleDeleteModalOpen={handleDeleteModalOpen}
+					hasSearchTerm={(searchTerm?.length ?? 0) > 0}
 				/>
 				{policyDetailsModalState.isOpen && (
 					<RoutingPolicyDetails

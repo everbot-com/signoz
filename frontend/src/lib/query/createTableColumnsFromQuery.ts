@@ -491,16 +491,18 @@ const fillDataFromList = (
 	listItem: ListItem,
 	columns: DynamicColumns,
 ): void => {
+	const listData = listItem.data || {};
 	columns.forEach((column) => {
 		if (isFormula(column.field)) return;
 
-		Object.keys(listItem.data).forEach((label) => {
+		Object.keys(listData).forEach((label) => {
 			if (column.dataIndex === label) {
-				if (listItem.data[label as ListItemKey] !== '') {
-					if (isObject(listItem.data[label as ListItemKey])) {
-						column.data.push(JSON.stringify(listItem.data[label as ListItemKey]));
+				const listValue = listData[label as ListItemKey];
+				if (listValue !== '') {
+					if (isObject(listValue)) {
+						column.data.push(JSON.stringify(listValue));
 					} else {
-						column.data.push(listItem.data[label as ListItemKey].toString());
+						column.data.push(listValue?.toString() ?? '');
 					}
 				} else {
 					column.data.push('N/A');
@@ -538,7 +540,7 @@ const fillDataFromTable = (
 		);
 
 		columns.forEach((column) => {
-			const rowData = row.data;
+			const rowData = row.data || {};
 			const columnField = column.id || column.title || column.field;
 
 			if (Object.prototype.hasOwnProperty.call(rowData, columnField)) {
@@ -662,21 +664,23 @@ const generateTableColumns = (
  *
  * @param columnKey - The column identifier (could be queryName.expression or queryName)
  * @param columnUnits - The column units mapping
- * @returns The unit string or undefined if not found
+ * @returns The unit string (none if the unit is set to empty string) or undefined if not found
  */
 export const getColumnUnit = (
 	columnKey: string,
 	columnUnits: Record<string, string>,
 ): string | undefined => {
 	// First try the exact match (new syntax: queryName.expression)
-	if (columnUnits[columnKey]) {
-		return columnUnits[columnKey];
+	if (columnUnits[columnKey] !== undefined) {
+		return columnUnits[columnKey] || 'none';
 	}
 
 	// Fallback to old syntax: extract queryName from queryName.expression
 	if (columnKey.includes('.')) {
 		const queryName = columnKey.split('.')[0];
-		return columnUnits[queryName];
+		if (columnUnits[queryName] !== undefined) {
+			return columnUnits[queryName] || 'none';
+		}
 	}
 
 	return undefined;

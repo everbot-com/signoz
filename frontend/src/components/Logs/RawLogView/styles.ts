@@ -30,6 +30,10 @@ export const RawLogViewContainer = styled(Row)<{
 
 	transition: background-color 0.2s ease-in;
 
+	&:not(:hover) .log-line-action-buttons {
+		display: none;
+	}
+
 	.log-state-indicator {
 		margin: 4px 0;
 
@@ -57,8 +61,8 @@ export const RawLogViewContainer = styled(Row)<{
 			  transition: background-color 2s ease-in;`
 			: ''}
 
-	${({ $isCustomHighlighted, $isDarkMode, $logType }): string =>
-		getCustomHighlightBackground($isCustomHighlighted, $isDarkMode, $logType)}
+	${({ $isCustomHighlighted }): string =>
+		getCustomHighlightBackground($isCustomHighlighted)}
 `;
 
 export const InfoIconWrapper = styled(Info)`

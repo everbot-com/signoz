@@ -12,7 +12,7 @@ export const mockSpan: Span = {
 	traceId: TEST_TRACE_ID,
 	name: TEST_SERVICE,
 	serviceName: TEST_SERVICE,
-	timestamp: 1640995200000000, // 2022-01-01 00:00:00 in microseconds
+	timestamp: 1640995200000, // 2022-01-01 00:00:00 in milliseconds
 	durationNano: 1000000000, // 1 second in nanoseconds
 	spanKind: 'server',
 	statusCodeString: 'STATUS_CODE_OK',
@@ -33,6 +33,19 @@ export const mockSpan: Span = {
 	hasSibling: false,
 	subTreeNodeCount: 0,
 	level: 0,
+};
+
+// Mock span with long status message (> 100 characters) for testing truncation
+export const mockSpanWithLongStatusMessage: Span = {
+	...mockSpan,
+	statusMessage:
+		'Error: Connection timeout occurred while trying to reach the database server. The connection pool was exhausted and all retry attempts failed after 30 seconds.',
+};
+
+// Mock span with short status message (<= 100 characters)
+export const mockSpanWithShortStatusMessage: Span = {
+	...mockSpan,
+	statusMessage: 'Connection successful',
 };
 
 // Mock logs with proper relationships
@@ -207,3 +220,4 @@ export const mockEmptyLogsResponse = {
 export const expectedSpanFilterExpression = `trace_id = '${TEST_TRACE_ID}' AND span_id = '${TEST_SPAN_ID}'`;
 export const expectedBeforeFilterExpression = `trace_id = '${TEST_TRACE_ID}' AND id < 'span-log-1'`;
 export const expectedAfterFilterExpression = `trace_id = '${TEST_TRACE_ID}' AND id > 'span-log-2'`;
+export const expectedTraceOnlyFilterExpression = `trace_id = '${TEST_TRACE_ID}'`;

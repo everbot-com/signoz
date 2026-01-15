@@ -60,7 +60,7 @@ export const Options: Option[] = [
 	{ value: '3d', label: 'Last 3 days' },
 	{ value: '1w', label: 'Last 1 week' },
 	{ value: '1month', label: 'Last 1 month' },
-	{ value: 'custom', label: 'Custom' },
+	{ value: 'custom', label: 'Custom Date Range' },
 ];
 
 export interface Option {
@@ -161,6 +161,10 @@ export const getDefaultOption = (route: string): Time => {
 	}
 	if (route === ROUTES.APPLICATION) {
 		return Options[2].value;
+	}
+
+	if (route === ROUTES.METER) {
+		return Options[5].value;
 	}
 	return Options[2].value;
 };

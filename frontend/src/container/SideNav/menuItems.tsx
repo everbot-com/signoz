@@ -26,6 +26,7 @@ import {
 	Receipt,
 	Route,
 	ScrollText,
+	Search,
 	Settings,
 	Slack,
 	Unplug,
@@ -189,6 +190,12 @@ export const primaryMenuItems: SidebarItem[] = [
 		itemKey: 'home',
 	},
 	{
+		key: 'quick-search',
+		label: 'Search',
+		icon: <Search size={16} />,
+		itemKey: 'quick-search',
+	},
+	{
 		key: ROUTES.LIST_ALL_ALERT,
 		label: 'Alerts',
 		icon: <BellDot size={16} />,
@@ -271,7 +278,7 @@ export const defaultMoreMenuItems: SidebarItem[] = [
 		icon: <ChartArea size={16} />,
 		isNew: false,
 		isEnabled: true,
-		isBeta: true,
+		isBeta: false,
 		itemKey: 'meter-explorer',
 	},
 	{

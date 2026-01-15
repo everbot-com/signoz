@@ -140,7 +140,7 @@ func (q *querier) QueryRange(ctx context.Context, orgID valuer.UUID, req *qbtype
 			if spec, ok := query.Spec.(qbtypes.QueryBuilderTraceOperator); ok {
 				// Parse expression to find dependencies
 				if err := spec.ParseExpression(); err != nil {
-					return nil, fmt.Errorf("failed to parse trace operator expression: %w", err)
+					return nil, err
 				}
 
 				deps := spec.CollectReferencedQueries(spec.ParsedExpression)
@@ -593,19 +593,31 @@ func (q *querier) run(
 		return nil, err
 	}
 
+	// attach step interval to metadata so client can make informed decisions, ex: width of the bar
+	// or go to related logs/traces from a point in line/bar chart with correct time range
+	stepIntervals := make(map[string]uint64, len(steps))
+	for name, step := range steps {
+		stepIntervals[name] = uint64(step.Duration.Seconds())
+	}
+	for _, query := range req.CompositeQuery.Queries {
+		if query.Type == qbtypes.QueryTypeFormula {
+			if formula, ok := query.Spec.(qbtypes.QueryBuilderFormula); ok {
+				formulaStepMs := q.calculateFormulaStep(formula.Expression, req)
+				stepIntervals[formula.Name] = uint64(formulaStepMs / 1000) // convert ms to seconds
+			}
+		}
+	}
+
 	resp := &qbtypes.QueryRangeResponse{
 		Type: req.RequestType,
 		Data: qbtypes.QueryData{
 			Results: maps.Values(processedResults),
 		},
-		Meta: struct {
-			RowsScanned  uint64 `json:"rowsScanned"`
-			BytesScanned uint64 `json:"bytesScanned"`
-			DurationMS   uint64 `json:"durationMs"`
-		}{
-			RowsScanned:  stats.RowsScanned,
-			BytesScanned: stats.BytesScanned,
-			DurationMS:   stats.DurationMS,
+		Meta: qbtypes.ExecStats{
+			RowsScanned:   stats.RowsScanned,
+			BytesScanned:  stats.BytesScanned,
+			DurationMS:    stats.DurationMS,
+			StepIntervals: stepIntervals,
 		},
 	}
 
@@ -652,7 +664,7 @@ func (q *querier) executeWithCache(ctx context.Context, orgID valuer.UUID, query
 
 	// Execute queries for missing ranges with bounded parallelism
 	freshResults := make([]*qbtypes.Result, len(missingRanges))
-	errors := make([]error, len(missingRanges))
+	errs := make([]error, len(missingRanges))
 	totalStats := qbtypes.ExecStats{}
 
 	q.logger.DebugContext(ctx, "executing queries for missing ranges",
@@ -673,14 +685,14 @@ func (q *querier) executeWithCache(ctx context.Context, orgID valuer.UUID, query
 			// Create a new query with the missing time range
 			rangedQuery := q.createRangedQuery(query, *tr)
 			if rangedQuery == nil {
-				errors[idx] = fmt.Errorf("failed to create ranged query for range %d-%d", tr.From, tr.To)
+				errs[idx] = errors.NewInternalf(errors.CodeInternal, "failed to create ranged query for range %d-%d", tr.From, tr.To)
 				return
 			}
 
 			// Execute the ranged query
 			result, err := rangedQuery.Execute(ctx)
 			if err != nil {
-				errors[idx] = err
+				errs[idx] = err
 				return
 			}
 
@@ -692,7 +704,7 @@ func (q *querier) executeWithCache(ctx context.Context, orgID valuer.UUID, query
 	wg.Wait()
 
 	// Check for errors
-	for _, err := range errors {
+	for _, err := range errs {
 		if err != nil {
 			// If any query failed, fall back to full execution
 			q.logger.ErrorContext(ctx, "parallel query execution failed", "error", err)

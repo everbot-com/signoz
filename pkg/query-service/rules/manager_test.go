@@ -2,611 +2,277 @@ package rules
 
 import (
 	"context"
+	"encoding/json"
+	"math"
+	"strconv"
 	"testing"
 	"time"
 
-	"github.com/SigNoz/signoz/pkg/alertmanager/nfmanager/nfmanagertest"
-	"github.com/stretchr/testify/assert"
-	"go.uber.org/zap"
-
 	"github.com/SigNoz/signoz/pkg/alertmanager"
-	"github.com/SigNoz/signoz/pkg/alertmanager/alertmanagerserver"
-	"github.com/SigNoz/signoz/pkg/alertmanager/signozalertmanager"
+	alertmanagermock "github.com/SigNoz/signoz/pkg/alertmanager/mocks"
 	"github.com/SigNoz/signoz/pkg/instrumentation/instrumentationtest"
-	"github.com/SigNoz/signoz/pkg/modules/organization/implorganization"
-	"github.com/SigNoz/signoz/pkg/query-service/utils"
-	"github.com/SigNoz/signoz/pkg/ruler/rulestore/rulestoretest"
-	"github.com/SigNoz/signoz/pkg/sharder"
-	"github.com/SigNoz/signoz/pkg/sharder/noopsharder"
-	"github.com/SigNoz/signoz/pkg/types"
+	"github.com/SigNoz/signoz/pkg/prometheus"
+	"github.com/SigNoz/signoz/pkg/prometheus/prometheustest"
+	"github.com/SigNoz/signoz/pkg/sqlstore"
+	"github.com/SigNoz/signoz/pkg/sqlstore/sqlstoretest"
+	"github.com/SigNoz/signoz/pkg/telemetrystore"
+	"github.com/SigNoz/signoz/pkg/telemetrystore/telemetrystoretest"
 	"github.com/SigNoz/signoz/pkg/types/alertmanagertypes"
-	"github.com/SigNoz/signoz/pkg/types/authtypes"
-	"github.com/SigNoz/signoz/pkg/types/ruletypes"
+	"github.com/SigNoz/signoz/pkg/types/metrictypes"
 	"github.com/SigNoz/signoz/pkg/valuer"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
+
+	cmock "github.com/srikanthccv/ClickHouse-go-mock"
 )
 
-func TestManager_PatchRule_PayloadVariations(t *testing.T) {
-	// Set up test claims and manager once for all test cases
-	claims := &authtypes.Claims{
-		UserID: "550e8400-e29b-41d4-a716-446655440000",
-		Email:  "test@example.com",
-		Role:   "admin",
-	}
-	manager, mockSQLRuleStore, orgId := setupTestManager(t)
-	claims.OrgID = orgId
+func TestManager_TestNotification_SendUnmatched_ThresholdRule(t *testing.T) {
+	target := 10.0
+	recovery := 5.0
 
-	testCases := []struct {
-		name           string
-		originalData   string
-		patchData      string
-		expectedResult func(*ruletypes.GettableRule) bool
-		expectError    bool
-		description    string
-	}{
-		{
-			name: "patch complete rule with task sync validation",
-			originalData: `{
-				"schemaVersion":"v1",
-				"alert": "test-original-alert",
-				"alertType": "METRIC_BASED_ALERT",
-				"ruleType": "threshold_rule",
-				"evalWindow": "5m0s",
-				"condition": {
-					"compositeQuery": {
-						"queryType": "builder",
-						"panelType": "graph",
-						"queries": [
-							{
-								"type": "builder_query",
-								"spec": {
-									"name": "A",
-									"signal": "metrics",
-									"disabled": false,
-									"aggregations": [
-										{
-											"metricName": "container.cpu.time",
-											"timeAggregation": "rate",
-											"spaceAggregation": "sum"
-										}
-									]
-								}
-							}
-						]
+	for _, tc := range TcTestNotiSendUnmatchedThresholdRule {
+		t.Run(tc.Name, func(t *testing.T) {
+			rule := ThresholdRuleAtLeastOnceValueAbove(target, &recovery)
+
+			// Marshal rule to JSON as TestNotification expects
+			ruleBytes, err := json.Marshal(rule)
+			require.NoError(t, err)
+
+			orgID := valuer.GenerateUUID()
+
+			// for saving temp alerts that are triggered via TestNotification
+			triggeredTestAlerts := []map[*alertmanagertypes.PostableAlert][]string{}
+
+			// Create manager using test factory with hooks
+			mgr := NewTestManager(t, &TestManagerOptions{
+				AlertmanagerHook: func(am alertmanager.Alertmanager) {
+					mockAM := am.(*alertmanagermock.MockAlertmanager)
+					// mock set notification config
+					mockAM.On("SetNotificationConfig", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil)
+					// for saving temp alerts that are triggered via TestNotification
+					if tc.ExpectAlerts > 0 {
+						mockAM.On("TestAlert", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Run(func(args mock.Arguments) {
+							triggeredTestAlerts = append(triggeredTestAlerts, args.Get(3).(map[*alertmanagertypes.PostableAlert][]string))
+						}).Return(nil).Times(tc.ExpectAlerts)
 					}
 				},
-				"labels": {
-					"severity": "warning"
+				SqlStoreHook: func(store sqlstore.SQLStore) {
+					mockStore := store.(*sqlstoretest.Provider)
+					// Mock the organizations query that SendAlerts makes
+					// Bun generates: SELECT id FROM organizations LIMIT 1 (or SELECT "id" FROM "organizations" LIMIT 1)
+					orgRows := mockStore.Mock().NewRows([]string{"id"}).AddRow(orgID.StringValue())
+					// Match bun's generated query pattern - bun may quote identifiers
+					mockStore.Mock().ExpectQuery("SELECT (.+) FROM (.+)organizations(.+) LIMIT (.+)").WillReturnRows(orgRows)
 				},
-				"disabled": false,
-				"preferredChannels": ["test-alerts"]
-			}`,
-			patchData: `{
-				"alert": "test-patched-alert",
-				"labels": {
-					"severity": "critical"
+				TelemetryStoreHook: func(store telemetrystore.TelemetryStore) {
+					mockStore := store.(*telemetrystoretest.Provider)
+					// Set up mock data for telemetry store
+					cols := make([]cmock.ColumnType, 0)
+					cols = append(cols, cmock.ColumnType{Name: "value", Type: "Float64"})
+					cols = append(cols, cmock.ColumnType{Name: "attr", Type: "String"})
+					cols = append(cols, cmock.ColumnType{Name: "ts", Type: "DateTime"})
+
+					alertDataRows := cmock.NewRows(cols, tc.Values)
+
+					mock := mockStore.Mock()
+
+					// Generate query arguments for the metric query
+					evalTime := time.Now().UTC()
+					evalWindow := 5 * time.Minute
+					evalDelay := time.Duration(0)
+					queryArgs := GenerateMetricQueryCHArgs(
+						evalTime,
+						evalWindow,
+						evalDelay,
+						"probe_success",
+						metrictypes.Unspecified,
+					)
+
+					mock.ExpectQuery("*WITH __temporal_aggregation_cte*").
+						WithArgs(queryArgs...).
+						WillReturnRows(alertDataRows)
+				},
+			})
+
+			count, apiErr := mgr.TestNotification(context.Background(), orgID, string(ruleBytes))
+			if apiErr != nil {
+				t.Logf("TestNotification error: %v, type: %s", apiErr.Err, apiErr.Typ)
+			}
+			require.Nil(t, apiErr)
+			assert.Equal(t, tc.ExpectAlerts, count)
+
+			if tc.ExpectAlerts > 0 {
+				// check if the alert has been triggered
+				require.Len(t, triggeredTestAlerts, 1)
+				var gotAlerts []*alertmanagertypes.PostableAlert
+				for a := range triggeredTestAlerts[0] {
+					gotAlerts = append(gotAlerts, a)
 				}
-			}`,
-			expectedResult: func(result *ruletypes.GettableRule) bool {
-				return result.AlertName == "test-patched-alert" &&
-					result.Labels["severity"] == "critical" &&
-					result.Disabled == false
-			},
-			expectError: false,
-		},
-		{
-			name: "patch rule to disabled state",
-			originalData: `{
-				"schemaVersion":"v2",
-				"alert": "test-disable-alert",
-				"alertType": "METRIC_BASED_ALERT",
-				"ruleType": "threshold_rule",
-				"evalWindow": "5m0s",
-				"condition": {
-					"thresholds": {
-						"kind": "basic",
-						"spec": [
-							{
-								"name": "WARNING",
-								"target": 30,
-								"matchType": "1",
-								"op": "1",
-								"selectedQuery": "A",
-								"channels": ["test-alerts"]
-							}
-						]
-					},
-					"compositeQuery": {
-						"queryType": "builder",
-						"panelType": "graph",
-						"queries": [
-							{
-								"type": "builder_query",
-								"spec": {
-									"name": "A",
-									"signal": "metrics",
-									"disabled": false,
-									"aggregations": [
-										{
-											"metricName": "container.memory.usage",
-											"timeAggregation": "avg",
-											"spaceAggregation": "sum"
-										}
-									]
-								}
-							}
-						]
-					}
-				},
-				"evaluation": {
-					"kind": "rolling",
-					"spec": {
-						"evalWindow": "5m",
-						"frequency": "1m"
-					}
-				},
-				"labels": {
-					"severity": "warning"
-				},
-				"disabled": false,
-				"preferredChannels": ["test-alerts"]
-			}`,
-			patchData: `{
-				"disabled": true
-			}`,
-			expectedResult: func(result *ruletypes.GettableRule) bool {
-				return result.Disabled == true
-			},
-			expectError: false,
-		},
-	}
-
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			ruleID := valuer.GenerateUUID()
-			existingRule := &ruletypes.Rule{
-				Identifiable: types.Identifiable{
-					ID: ruleID,
-				},
-				TimeAuditable: types.TimeAuditable{
-					CreatedAt: time.Now(),
-					UpdatedAt: time.Now(),
-				},
-				UserAuditable: types.UserAuditable{
-					CreatedBy: "creator@example.com",
-					UpdatedBy: "creator@example.com",
-				},
-				Data:  tc.originalData,
-				OrgID: claims.OrgID,
-			}
-
-			mockSQLRuleStore.ExpectGetStoredRule(ruleID, existingRule)
-			mockSQLRuleStore.ExpectEditRule(existingRule)
-
-			ctx := authtypes.NewContextWithClaims(context.Background(), *claims)
-			result, err := manager.PatchRule(ctx, tc.patchData, ruleID)
-
-			assert.NoError(t, err)
-			assert.NotNil(t, result)
-			assert.Equal(t, ruleID.StringValue(), result.Id)
-
-			if tc.expectedResult != nil {
-				assert.True(t, tc.expectedResult(result), "Expected result validation failed")
-			}
-			taskName := prepareTaskName(result.Id)
-
-			if result.Disabled {
-				syncCompleted := waitForTaskSync(manager, taskName, false, 2*time.Second)
-				assert.True(t, syncCompleted, "Task synchronization should complete within timeout")
-				assert.Nil(t, findTaskByName(manager.RuleTasks(), taskName), "Task should be removed for disabled rule")
+				require.Len(t, gotAlerts, tc.ExpectAlerts)
+				// check if the alert has triggered with correct threshold value
+				if tc.ExpectValue != 0 {
+					assert.Equal(t, strconv.FormatFloat(tc.ExpectValue, 'f', -1, 64), gotAlerts[0].Annotations["value"])
+				}
 			} else {
-				syncCompleted := waitForTaskSync(manager, taskName, true, 2*time.Second)
-				assert.True(t, syncCompleted, "Task synchronization should complete within timeout")
-				assert.NotNil(t, findTaskByName(manager.RuleTasks(), taskName), "Task should be created/updated for enabled rule")
-				assert.Greater(t, len(manager.Rules()), 0, "Rules should be updated in manager")
+				// check if no alerts have been triggered
+				assert.Empty(t, triggeredTestAlerts)
 			}
-
-			assert.NoError(t, mockSQLRuleStore.AssertExpectations())
 		})
 	}
 }
 
-func waitForTaskSync(manager *Manager, taskName string, expectedExists bool, timeout time.Duration) bool {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		task := findTaskByName(manager.RuleTasks(), taskName)
-		exists := task != nil
+func TestManager_TestNotification_SendUnmatched_PromRule(t *testing.T) {
+	target := 10.0
 
-		if exists == expectedExists {
-			return true
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	return false
-}
+	for _, tc := range TcTestNotificationSendUnmatchedPromRule {
+		t.Run(tc.Name, func(t *testing.T) {
+			// Capture base time once per test case to ensure consistent timestamps
+			baseTime := time.Now().UTC()
 
-// findTaskByName finds a task by name in the slice of tasks
-func findTaskByName(tasks []Task, taskName string) Task {
-	for i := 0; i < len(tasks); i++ {
-		if tasks[i].Name() == taskName {
-			return tasks[i]
-		}
-	}
-	return nil
-}
+			rule := BuildPromAtLeastOnceValueAbove(target, nil)
 
-func setupTestManager(t *testing.T) (*Manager, *rulestoretest.MockSQLRuleStore, string) {
-	settings := instrumentationtest.New().ToProviderSettings()
-	testDB := utils.NewQueryServiceDBForTests(t)
+			// Marshal rule to JSON as TestNotification expects
+			ruleBytes, err := json.Marshal(rule)
+			require.NoError(t, err)
 
-	err := utils.CreateTestOrg(t, testDB)
-	if err != nil {
-		t.Fatalf("Failed to create test org: %v", err)
-	}
-	testOrgID, err := utils.GetTestOrgId(testDB)
-	if err != nil {
-		t.Fatalf("Failed to get test org ID: %v", err)
-	}
+			orgID := valuer.GenerateUUID()
 
-	//will replace this with alertmanager mock
-	newConfig := alertmanagerserver.NewConfig()
-	defaultConfig, err := alertmanagertypes.NewDefaultConfig(newConfig.Global, newConfig.Route, testOrgID.StringValue())
-	if err != nil {
-		t.Fatalf("Failed to create default alertmanager config: %v", err)
-	}
+			// for saving temp alerts that are triggered via TestNotification
+			triggeredTestAlerts := []map[*alertmanagertypes.PostableAlert][]string{}
 
-	_, err = testDB.BunDB().NewInsert().
-		Model(defaultConfig.StoreableConfig()).
-		Exec(context.Background())
-	if err != nil {
-		t.Fatalf("Failed to insert alertmanager config: %v", err)
-	}
+			// Variable to store promProvider for cleanup
+			var promProvider *prometheustest.Provider
 
-	noopSharder, err := noopsharder.New(context.TODO(), settings, sharder.Config{})
-	if err != nil {
-		t.Fatalf("Failed to create noop sharder: %v", err)
-	}
-	orgGetter := implorganization.NewGetter(implorganization.NewStore(testDB), noopSharder)
-	notificationManager := nfmanagertest.NewMock()
-	alertManager, err := signozalertmanager.New(context.TODO(), settings, alertmanager.Config{Provider: "signoz", Signoz: alertmanager.Signoz{PollInterval: 10 * time.Second, Config: alertmanagerserver.NewConfig()}}, testDB, orgGetter, notificationManager)
-	if err != nil {
-		t.Fatalf("Failed to create alert manager: %v", err)
-	}
-	mockSQLRuleStore := rulestoretest.NewMockSQLRuleStore()
+			// Create manager using test factory with hooks
+			mgr := NewTestManager(t, &TestManagerOptions{
+				AlertmanagerHook: func(am alertmanager.Alertmanager) {
+					mockAM := am.(*alertmanagermock.MockAlertmanager)
+					// mock set notification config
+					mockAM.On("SetNotificationConfig", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil)
+					// for saving temp alerts that are triggered via TestNotification
+					if tc.ExpectAlerts > 0 {
+						mockAM.On("TestAlert", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Run(func(args mock.Arguments) {
+							triggeredTestAlerts = append(triggeredTestAlerts, args.Get(3).(map[*alertmanagertypes.PostableAlert][]string))
+						}).Return(nil).Times(tc.ExpectAlerts)
+					}
+				},
+				SqlStoreHook: func(store sqlstore.SQLStore) {
+					mockStore := store.(*sqlstoretest.Provider)
+					// Mock the organizations query that SendAlerts makes
+					orgRows := mockStore.Mock().NewRows([]string{"id"}).AddRow(orgID.StringValue())
+					mockStore.Mock().ExpectQuery("SELECT (.+) FROM (.+)organizations(.+) LIMIT (.+)").WillReturnRows(orgRows)
+				},
+				TelemetryStoreHook: func(store telemetrystore.TelemetryStore) {
+					mockStore := store.(*telemetrystoretest.Provider)
 
-	options := ManagerOptions{
-		Context:         context.Background(),
-		Logger:          zap.L(),
-		SLogger:         instrumentationtest.New().Logger(),
-		EvalDelay:       time.Minute,
-		PrepareTaskFunc: defaultPrepareTaskFunc,
-		Alertmanager:    alertManager,
-		OrgGetter:       orgGetter,
-		RuleStore:       mockSQLRuleStore,
-	}
+					// Set up Prometheus-specific mock data
+					// Fingerprint columns for Prometheus queries
+					fingerprintCols := []cmock.ColumnType{
+						{Name: "fingerprint", Type: "UInt64"},
+						{Name: "any(labels)", Type: "String"},
+					}
 
-	manager, err := NewManager(&options)
-	if err != nil {
-		t.Fatalf("Failed to create manager: %v", err)
-	}
+					// Samples columns for Prometheus queries
+					samplesCols := []cmock.ColumnType{
+						{Name: "metric_name", Type: "String"},
+						{Name: "fingerprint", Type: "UInt64"},
+						{Name: "unix_milli", Type: "Int64"},
+						{Name: "value", Type: "Float64"},
+						{Name: "flags", Type: "UInt32"},
+					}
 
-	close(manager.block)
-	return manager, mockSQLRuleStore, testOrgID.StringValue()
-}
+					// Calculate query time range similar to Prometheus rule tests
+					// TestNotification uses time.Now().UTC() for evaluation
+					// We calculate the query window based on current time to match what the actual evaluation will use
+					evalTime := baseTime
+					evalWindowMs := int64(5 * 60 * 1000) // 5 minutes in ms
+					evalTimeMs := evalTime.UnixMilli()
+					queryStart := ((evalTimeMs-2*evalWindowMs)/60000)*60000 + 1 // truncate to minute + 1ms
+					queryEnd := (evalTimeMs / 60000) * 60000                    // truncate to minute
 
-func TestCreateRule(t *testing.T) {
-	claims := &authtypes.Claims{
-		Email: "test@example.com",
-	}
-	manager, mockSQLRuleStore, orgId := setupTestManager(t)
-	claims.OrgID = orgId
-	testCases := []struct {
-		name    string
-		ruleStr string
-	}{
-		{
-			name: "validate stored rule data structure",
-			ruleStr: `{
-				"alert": "cpu usage",
-				"ruleType": "threshold_rule",
-				"evalWindow": "5m",
-				"frequency": "1m",
-				"condition": {
-					"compositeQuery": {
-						"queryType": "builder",
-						"builderQueries": {
-							"A": {
-								"expression": "A",
-								"disabled": false,
-								"dataSource": "metrics",
-								"aggregateOperator": "avg",
-								"aggregateAttribute": {
-									"key": "cpu_usage",
-									"type": "Gauge"
-								}
-							}
+					// Create fingerprint data
+					fingerprint := uint64(12345)
+					labelsJSON := `{"__name__":"test_metric"}`
+					fingerprintData := [][]interface{}{
+						{fingerprint, labelsJSON},
+					}
+					fingerprintRows := cmock.NewRows(fingerprintCols, fingerprintData)
+
+					// Create samples data from test case values, calculating timestamps relative to baseTime
+					validSamplesData := make([][]interface{}, 0)
+					for _, v := range tc.Values {
+						// Skip NaN and Inf values in the samples data
+						if math.IsNaN(v.Value) || math.IsInf(v.Value, 0) {
+							continue
 						}
-					},
-					"op": "1",
-					"target": 80,
-					"matchType": "1"
-				},
-				"labels": {
-					"severity": "warning"
-				},
-				"annotations": {
-					"summary": "High CPU usage detected"
-				},
-				"preferredChannels": ["test-alerts"]
-			}`,
-		},
-		{
-			name: "create complete v2 rule with thresholds",
-			ruleStr: `{
-				"schemaVersion":"v2",
-				"state": "firing",
-				"alert": "test-multi-threshold-create",
-				"alertType": "METRIC_BASED_ALERT",
-				"ruleType": "threshold_rule",
-				"evalWindow": "5m0s",
-				"condition": {
-					"thresholds": {
-						"kind": "basic",
-						"spec": [
-							{
-								"name": "CRITICAL",
-								"target": 0,
-								"matchType": "1",
-								"op": "1",
-								"selectedQuery": "A",
-								"channels": ["test-alerts"]
-							},
-							{
-								"name": "WARNING",
-								"target": 0,
-								"matchType": "1",
-								"op": "1",
-								"selectedQuery": "A",
-								"channels": ["test-alerts"]
-							}
-						]
-					},
-					"compositeQuery": {
-						"queryType": "builder",
-						"panelType": "graph",
-						"queries": [
-							{
-								"type": "builder_query",
-								"spec": {
-									"name": "A",
-									"signal": "metrics",
-									"disabled": false,
-									"aggregations": [
-										{
-											"metricName": "container.cpu.time",
-											"timeAggregation": "rate",
-											"spaceAggregation": "sum"
-										}
-									]
-								}
-							}
-						]
+						// Calculate timestamp relative to baseTime
+						sampleTimestamp := baseTime.Add(v.Offset).UnixMilli()
+						validSamplesData = append(validSamplesData, []interface{}{
+							"test_metric",
+							fingerprint,
+							sampleTimestamp,
+							v.Value,
+							uint32(0), // flags - 0 means normal value
+						})
 					}
-				},
-				"evaluation": {
-					"kind": "rolling",
-					"spec": {
-						"evalWindow": "6m",
-						"frequency": "1m"
-					}
-				},
-				"labels": {
-					"severity": "warning"
-				},
-				"annotations": {
-					"description": "This alert is fired when the defined metric crosses the threshold",
-					"summary": "The rule threshold is set and the observed metric value is evaluated"
-				},
-				"disabled": false,
-				"preferredChannels": ["#test-alerts-v2"],
-				"version": "v5"
-			}`,
-		},
-	}
+					samplesRows := cmock.NewRows(samplesCols, validSamplesData)
 
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			rule := &ruletypes.Rule{
-				Identifiable: types.Identifiable{
-					ID: valuer.GenerateUUID(),
+					mock := mockStore.Mock()
+
+					// Mock the fingerprint query (for Prometheus label matching)
+					mock.ExpectQuery("SELECT fingerprint, any").
+						WithArgs("test_metric", "__name__", "test_metric").
+						WillReturnRows(fingerprintRows)
+
+					// Mock the samples query (for Prometheus metric data)
+					mock.ExpectQuery("SELECT metric_name, fingerprint, unix_milli").
+						WithArgs(
+							"test_metric",
+							"test_metric",
+							"__name__",
+							"test_metric",
+							queryStart,
+							queryEnd,
+						).
+						WillReturnRows(samplesRows)
+
+					// Create Prometheus provider for this test
+					promProvider = prometheustest.New(context.Background(), instrumentationtest.New().ToProviderSettings(), prometheus.Config{}, store)
 				},
-				TimeAuditable: types.TimeAuditable{
-					CreatedAt: time.Now(),
-					UpdatedAt: time.Now(),
+				ManagerOptionsHook: func(opts *ManagerOptions) {
+					// Set Prometheus provider for PromQL queries
+					if promProvider != nil {
+						opts.Prometheus = promProvider
+					}
 				},
-				UserAuditable: types.UserAuditable{
-					CreatedBy: claims.Email,
-					UpdatedBy: claims.Email,
-				},
-				OrgID: claims.OrgID,
+			})
+
+			count, apiErr := mgr.TestNotification(context.Background(), orgID, string(ruleBytes))
+			if apiErr != nil {
+				t.Logf("TestNotification error: %v, type: %s", apiErr.Err, apiErr.Typ)
 			}
-			mockSQLRuleStore.ExpectCreateRule(rule)
+			require.Nil(t, apiErr)
+			assert.Equal(t, tc.ExpectAlerts, count)
 
-			ctx := authtypes.NewContextWithClaims(context.Background(), *claims)
-			result, err := manager.CreateRule(ctx, tc.ruleStr)
-
-			assert.NoError(t, err)
-			assert.NotNil(t, result)
-			assert.NotEmpty(t, result.Id, "Result should have a valid ID")
-
-			// Wait for task creation with proper synchronization
-			taskName := prepareTaskName(result.Id)
-			syncCompleted := waitForTaskSync(manager, taskName, true, 2*time.Second)
-			assert.True(t, syncCompleted, "Task creation should complete within timeout")
-			assert.NotNil(t, findTaskByName(manager.RuleTasks(), taskName), "Task should be created with correct name")
-			assert.Greater(t, len(manager.Rules()), 0, "Rules should be added to manager")
-
-			assert.NoError(t, mockSQLRuleStore.AssertExpectations())
-		})
-	}
-}
-
-func TestEditRule(t *testing.T) {
-	// Set up test claims and manager once for all test cases
-	claims := &authtypes.Claims{
-		Email: "test@example.com",
-	}
-	manager, mockSQLRuleStore, orgId := setupTestManager(t)
-	claims.OrgID = orgId
-	testCases := []struct {
-		name    string
-		ruleStr string
-	}{
-		{
-			name: "validate edit rule functionality",
-			ruleStr: `{
-				"alert": "updated cpu usage",
-				"ruleType": "threshold_rule",
-				"evalWindow": "10m",
-				"frequency": "2m",
-				"condition": {
-					"compositeQuery": {
-						"queryType": "builder",
-						"builderQueries": {
-							"A": {
-								"expression": "A",
-								"disabled": false,
-								"dataSource": "metrics",
-								"aggregateOperator": "avg",
-								"aggregateAttribute": {
-									"key": "cpu_usage",
-									"type": "Gauge"
-								}
-							}
-						}
-					},
-					"op": "1",
-					"target": 90,
-					"matchType": "1"
-				},
-				"labels": {
-					"severity": "critical"
-				},
-				"annotations": {
-					"summary": "Very high CPU usage detected"
-				},
-				"preferredChannels": ["critical-alerts"]
-			}`,
-		},
-		{
-			name: "edit complete v2 rule with thresholds",
-			ruleStr: `{
-				"schemaVersion":"v2",
-				"state": "firing",
-				"alert": "test-multi-threshold-edit",
-				"alertType": "METRIC_BASED_ALERT",
-				"ruleType": "threshold_rule",
-				"evalWindow": "5m0s",
-				"condition": {
-					"thresholds": {
-						"kind": "basic",
-						"spec": [
-							{
-								"name": "CRITICAL",
-								"target": 10,
-								"matchType": "1",
-								"op": "1",
-								"selectedQuery": "A",
-								"channels": ["test-alerts"]
-							},
-							{
-								"name": "WARNING",
-								"target": 5,
-								"matchType": "1",
-								"op": "1",
-								"selectedQuery": "A",
-								"channels": ["test-alerts"]
-							}
-						]
-					},
-					"compositeQuery": {
-						"queryType": "builder",
-						"panelType": "graph",
-						"queries": [
-							{
-								"type": "builder_query",
-								"spec": {
-									"name": "A",
-									"signal": "metrics",
-									"disabled": false,
-									"aggregations": [
-										{
-											"metricName": "container.memory.usage",
-											"timeAggregation": "avg",
-											"spaceAggregation": "sum"
-										}
-									]
-								}
-							}
-						]
-					}
-				},
-				"evaluation": {
-					"kind": "rolling",
-					"spec": {
-						"evalWindow": "8m",
-						"frequency": "2m"
-					}
-				},
-				"labels": {
-					"severity": "critical"
-				},
-				"annotations": {
-					"description": "This alert is fired when memory usage crosses the threshold",
-					"summary": "Memory usage threshold exceeded"
-				},
-				"disabled": false,
-				"preferredChannels": ["#critical-alerts-v2"],
-				"version": "v5"
-			}`,
-		},
-	}
-
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			ruleID := valuer.GenerateUUID()
-
-			existingRule := &ruletypes.Rule{
-				Identifiable: types.Identifiable{
-					ID: ruleID,
-				},
-				TimeAuditable: types.TimeAuditable{
-					CreatedAt: time.Now(),
-					UpdatedAt: time.Now(),
-				},
-				UserAuditable: types.UserAuditable{
-					CreatedBy: "creator@example.com",
-					UpdatedBy: "creator@example.com",
-				},
-				Data:  `{"alert": "original cpu usage", "disabled": false}`,
-				OrgID: claims.OrgID,
+			if tc.ExpectAlerts > 0 {
+				// check if the alert has been triggered
+				require.Len(t, triggeredTestAlerts, 1)
+				var gotAlerts []*alertmanagertypes.PostableAlert
+				for a := range triggeredTestAlerts[0] {
+					gotAlerts = append(gotAlerts, a)
+				}
+				require.Len(t, gotAlerts, tc.ExpectAlerts)
+				// check if the alert has triggered with correct threshold value
+				if tc.ExpectValue != 0 && !math.IsNaN(tc.ExpectValue) && !math.IsInf(tc.ExpectValue, 0) {
+					assert.Equal(t, strconv.FormatFloat(tc.ExpectValue, 'f', -1, 64), gotAlerts[0].Annotations["value"])
+				}
+			} else {
+				// check if no alerts have been triggered
+				assert.Empty(t, triggeredTestAlerts)
 			}
 
-			mockSQLRuleStore.ExpectGetStoredRule(ruleID, existingRule)
-			mockSQLRuleStore.ExpectEditRule(existingRule)
-
-			ctx := authtypes.NewContextWithClaims(context.Background(), *claims)
-			err := manager.EditRule(ctx, tc.ruleStr, ruleID)
-
-			assert.NoError(t, err)
-
-			// Wait for task update with proper synchronization
-			taskName := prepareTaskName(ruleID.StringValue())
-			syncCompleted := waitForTaskSync(manager, taskName, true, 2*time.Second)
-			assert.True(t, syncCompleted, "Task update should complete within timeout")
-			assert.NotNil(t, findTaskByName(manager.RuleTasks(), taskName), "Task should be updated with correct name")
-			assert.Greater(t, len(manager.Rules()), 0, "Rules should be updated in manager")
-
-			assert.NoError(t, mockSQLRuleStore.AssertExpectations())
+			promProvider.Close()
 		})
 	}
 }

@@ -25,7 +25,10 @@ export function usePreferenceSync({
 	updateColumns: (newColumns: TelemetryFieldKey[]) => void;
 	updateFormatting: (newFormatting: FormattingOptions) => void;
 } {
-	const { data: viewsData } = useGetAllViews(dataSource);
+	const { data: viewsData } = useGetAllViews(
+		dataSource,
+		mode === PreferenceMode.SAVED_VIEW,
+	);
 
 	const [
 		savedViewPreferences,
@@ -55,7 +58,7 @@ export function usePreferenceSync({
 				updateExtraDataSelectColumns(parsedExtraData?.selectColumns) ||
 				defaultLogsSelectedColumns;
 			formatting = {
-				maxLines: parsedExtraData?.maxLines ?? 2,
+				maxLines: parsedExtraData?.maxLines ?? 1,
 				format: parsedExtraData?.format ?? 'table',
 				fontSize: parsedExtraData?.fontSize ?? 'small',
 				version: parsedExtraData?.version ?? 1,
